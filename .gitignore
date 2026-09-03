@@ -1,0 +1,43 @@
+# MnemoPort private planning and local research
+.private/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Node.js package wrappers and tooling
+node_modules/
+.npm/
+.pnpm-store/
+
+# Build and test output
+/dist/
+/build/
+/coverage/
+*.profraw
+*.profdata
+
+# Local MnemoPort packages and test artifacts
+*.mnemo
+*.mnemo.tmp
+/tmp/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating systems
+.DS_Store
+Thumbs.db
+Desktop.ini
+
