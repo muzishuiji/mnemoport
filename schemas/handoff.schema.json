@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mnemoport.dev/schemas/handoff.schema.json",
+  "title": "MnemoPort Handoff Capsule",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source", "goal"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "source": { "enum": ["claude-code", "codex", "qoder", "cursor"] },
+    "goal": { "type": "string", "minLength": 1 },
+    "latest_request": { "type": ["string", "null"] },
+    "constraints": { "$ref": "#/$defs/stringList" },
+    "decisions": { "$ref": "#/$defs/stringList" },
+    "completed": { "$ref": "#/$defs/stringList" },
+    "pending": { "$ref": "#/$defs/stringList" },
+    "workspace": { "type": ["string", "null"] },
+    "git_head": { "type": ["string", "null"] },
+    "git_dirty": { "type": ["boolean", "null"] },
+    "validation": { "$ref": "#/$defs/stringList" },
+    "risks": { "$ref": "#/$defs/stringList" }
+  },
+  "$defs": {
+    "stringList": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    }
+  }
+}

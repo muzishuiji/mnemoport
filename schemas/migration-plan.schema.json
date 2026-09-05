@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mnemoport.io/schemas/migration-plan.schema.json",
+  "title": "MnemoPort Migration Plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "plan_id",
+    "source_root_hash",
+    "target",
+    "adapter_version",
+    "capability_snapshot_hash",
+    "operations"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "plan_id": { "$ref": "#/$defs/hash" },
+    "source_root_hash": { "$ref": "#/$defs/hash" },
+    "target": { "$ref": "product-tuple.schema.json" },
+    "adapter_version": { "type": "string", "minLength": 1 },
+    "capability_snapshot_hash": { "$ref": "#/$defs/hash" },
+    "operations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "kind",
+          "phase",
+          "asset_id",
+          "preconditions",
+          "effect",
+          "verification",
+          "rollback",
+          "approval"
+        ],
+        "properties": {
+          "operation_id": { "$ref": "#/$defs/hash" },
+          "kind": {
+            "enum": ["write_file", "merge_config", "install_plugin", "register_mcp", "manual_step", "noop"]
+          },
+          "phase": { "enum": ["transactional-core", "external-action"] },
+          "asset_id": { "type": "string", "minLength": 1 },
+          "preconditions": { "type": "array" },
+          "effect": {},
+          "verification": {},
+          "rollback": { "enum": ["strong", "compensating", "none"] },
+          "approval": { "enum": ["none", "write", "external", "secret", "user_resolution"] }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+  }
+}

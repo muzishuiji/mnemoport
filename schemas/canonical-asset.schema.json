@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mnemoport.io/schemas/canonical-asset.schema.json",
+  "title": "MnemoPort Canonical Asset",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "asset_id",
+    "kind",
+    "scope",
+    "title",
+    "content_hash",
+    "sensitivity",
+    "provenance",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "asset_id": { "$ref": "#/$defs/hash" },
+    "kind": {
+      "enum": [
+        "instruction",
+        "skill",
+        "mcp",
+        "prompt",
+        "preference",
+        "memory",
+        "plugin",
+        "handoff",
+        "inventory_only"
+      ]
+    },
+    "scope": {
+      "enum": ["organization", "user", "device", "workspace", "project", "session"]
+    },
+    "title": { "type": "string", "minLength": 1 },
+    "content_hash": { "$ref": "#/$defs/hash" },
+    "sensitivity": {
+      "enum": ["public", "private", "secret_reference", "quarantined"]
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "locator", "evidence", "source_hash", "model_inferred"],
+      "properties": {
+        "platform": { "enum": ["claude-code", "codex", "qoder", "cursor"] },
+        "locator": { "type": "string", "minLength": 1 },
+        "evidence": {
+          "enum": ["documented", "observed", "probe", "official_interface", "excluded"]
+        },
+        "source_hash": { "$ref": "#/$defs/hash" },
+        "model_inferred": { "type": "boolean" }
+      }
+    },
+    "payload": {
+      "type": "object",
+      "required": ["type", "value"],
+      "properties": {
+        "type": {
+          "enum": ["text", "file_tree", "mcp_server", "plugin_intent", "inventory", "handoff"]
+        },
+        "value": {}
+      }
+    }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+  }
+}

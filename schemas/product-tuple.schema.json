@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mnemoport.dev/schemas/product-tuple/1.0.json",
+  "title": "MnemoPort product tuple",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["platform", "version", "os", "entrypoint", "executable", "config_root", "evidence"],
+  "properties": {
+    "platform": { "enum": ["claude-code", "codex", "qoder", "cursor"] },
+    "version": { "type": ["string", "null"] },
+    "os": { "type": "string", "minLength": 1 },
+    "entrypoint": { "enum": ["cli", "desktop-app", "ide-editor", "jetbrains", "agent", "unknown"] },
+    "executable": { "type": ["string", "null"] },
+    "config_root": { "type": ["string", "null"] },
+    "evidence": { "enum": ["documented", "observed", "probe", "official_interface", "excluded"] }
+  }
+}
+

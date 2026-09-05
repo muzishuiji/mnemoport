@@ -2,7 +2,7 @@
 
 Thank you for your interest in MnemoPort.
 
-The project is currently defining its canonical asset model, adapter contracts, security boundaries, and compatibility fixtures. Before submitting a substantial implementation, please open an issue describing:
+The project is an implementation-stage alpha with a frozen v1 package/schema baseline. Before submitting a substantial implementation, please open an issue describing:
 
 - the source and target platform involved;
 - the asset types and scopes being handled;
@@ -19,6 +19,6 @@ The project is currently defining its canonical asset model, adapter contracts, 
 - Keep version-specific platform behavior isolated inside its adapter.
 - Add tests for malformed input, conflicts, repeated application, and rollback.
 - Clearly label undocumented or reverse-engineered behavior.
+- Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace --all-features`.
 
 By contributing, you agree that your contributions will be licensed under the project's MIT License.
-

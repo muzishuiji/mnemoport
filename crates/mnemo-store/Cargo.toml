@@ -1,0 +1,22 @@
+[package]
+name = "mnemo-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+directories.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+mnemo-security = { path = "../mnemo-security" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

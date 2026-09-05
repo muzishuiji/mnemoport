@@ -1,0 +1,30 @@
+[package]
+name = "mnemo-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mnemo"
+path = "src/main.rs"
+
+[dependencies]
+age.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+mnemo-adapter-common = { path = "../adapters/common" }
+mnemo-core = { path = "../mnemo-core" }
+mnemo-package = { path = "../mnemo-package" }
+mnemo-schema = { path = "../mnemo-schema" }
+mnemo-security = { path = "../mnemo-security" }
+mnemo-store = { path = "../mnemo-store" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

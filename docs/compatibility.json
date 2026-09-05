@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "release": "0.1.0-alpha",
+  "generated_on": "2026-09-06",
+  "evidence_policy": "Claims do not transfer across version, OS, entrypoint, asset, or direction.",
+  "fixture_contract": {
+    "source_version": "fixture-contract-v0.1",
+    "target_version": "fixture-contract-v0.1",
+    "os": "linux",
+    "source_entrypoint": "offline-static",
+    "target_entrypoint": "filesystem-contract",
+    "evidence": "l0-fixture"
+  },
+  "directions": [
+    { "source": "claude-code", "target": "claude-code", "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
+    { "source": "claude-code", "target": "codex",       "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
+    { "source": "claude-code", "target": "qoder",       "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
+    { "source": "claude-code", "target": "cursor",      "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
+    { "source": "codex",       "target": "claude-code", "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "manual_scope_mapping", "handoff": "verified" } },
+    { "source": "codex",       "target": "codex",       "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
+    { "source": "codex",       "target": "qoder",       "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "manual_scope_mapping", "handoff": "verified" } },
+    { "source": "codex",       "target": "cursor",      "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
+    { "source": "qoder",       "target": "claude-code", "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
+    { "source": "qoder",       "target": "codex",       "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
+    { "source": "qoder",       "target": "qoder",       "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
+    { "source": "qoder",       "target": "cursor",      "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
+    { "source": "cursor",      "target": "claude-code", "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
+    { "source": "cursor",      "target": "codex",       "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
+    { "source": "cursor",      "target": "qoder",       "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
+    { "source": "cursor",      "target": "cursor",      "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } }
+  ],
+  "non_automatic_assets": {
+    "native_auto_memory": "manual_or_inventory_only",
+    "plugins_and_extensions": "manual_intent_only",
+    "cli_dependencies": "manual_intent_only",
+    "editor_profile": "use_official_export_import",
+    "sessions_and_auth": "excluded"
+  }
+}
