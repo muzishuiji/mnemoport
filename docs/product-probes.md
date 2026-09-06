@@ -1,6 +1,6 @@
 # Product probes
 
-`mnemo detect` never starts a product. `mnemo probe` is a separate, explicit local-assisted operation that produces version-level L1 evidence for an exact platform, OS, and entrypoint tuple.
+`mnemo detect` never starts a product. `mnemo probe` is a separate, explicit local-assisted operation that produces version-level evidence for an exact platform, OS, and entrypoint tuple. After L0 file verification succeeds, `mnemo verify --level l1` can request asset-level native discovery for the same exact tuple.
 
 ## Safety contract
 
@@ -50,3 +50,35 @@ An asset-level L1 recipe is admitted separately for each `product version × OS 
 - timeout, output limits, sanitized diagnostics, and a negative control that cannot pass from directory presence alone.
 
 A command named `list` is not automatically safe. If it performs health checks, synchronizes a marketplace, starts an MCP server, invokes a model, or requires account state, that step is L2/account-assisted and requires separate authorization. Products without a safe authoritative discovery surface remain at L0 with an explicit manual result.
+
+## Implemented asset-level recipes
+
+The automatic allowlist in `v0.1.0-alpha.1` is intentionally narrow:
+
+| Exact tuple | Asset | Fixed command | Isolated input | Pass condition |
+|---|---|---|---|---|
+| Codex CLI `0.144.1`, Linux | MCP | `codex mcp list --json` | A private disposable clone of target `config.toml` and workspace `.codex/config.toml` | Structured JSON contains every expected migrated MCP name |
+| Qoder CLI `1.1.42`, Linux | Skill | `qodercli skills list --all` | A private disposable config/workspace containing only migrated `SKILL.md` files | Version-gated text contains each Skill name and a `Location:` under the disposable root |
+
+Both commands run without a shell or standard input. The environment is cleared except for the fixed product roots, disposable OS data/cache/temp roots, `PATH`, and required Windows runtime variables. Codex has a 10-second timeout and Qoder a 20-second timeout. Combined stdout/stderr is terminated above 64 KiB; reports contain only stable diagnostics and counts. Temporary roots are deleted when verification returns. The parser cannot pass from target-directory presence alone, and `migrated_components_started` is always `false`.
+
+Codex is not pointed at the live target during the native check because the observed CLI may create incidental temporary state even for a list command. Qoder likewise created machine/log/security state during direct testing, so only its isolated clone is used. The recipes never copy authentication stores or provider credentials into that clone.
+
+## Asset-level status matrix
+
+The following statuses apply only to migrated asset kinds present in the immutable plan:
+
+| Product | Instructions | Skills | MCP |
+|---|---|---|---|
+| Claude Code CLI | `manual` | `manual` | `manual` |
+| Codex CLI `0.144.1` on Linux | `manual` | `manual` | `verified` through the recipe above |
+| Qoder CLI `1.1.42` on Linux | `manual` | `verified` through the recipe above | `manual` |
+| Cursor Agent/IDE | `manual` | `manual` | `manual` |
+
+For Codex MCP or Qoder Skill, a missing executable reports `unavailable`; a different version, OS, entrypoint, or config root reports `unsupported_version`. Asset kinds without an admitted recipe report `manual`. A parser mismatch, non-zero exit, timeout, or output-limit termination reports `failed`. Any non-`verified` asset result makes `verify --level l1` return exit code `2`, while preserving the successful L0 result.
+
+These are discovery claims, not execution claims. Claude Code MCP listing is manual because the available command may perform server health checks. Cursor's native MCP/tool surfaces and fast-moving Skills/Agent Plugins remain manual because the observed commands cross into component initialization or lack a stable exact-version discovery contract. No product's plugin marketplace, extension installer, auto-memory database, session store, or account state is touched.
+
+## Reproduced observations
+
+On 2026-09-06, Linux end-to-end fixtures were exported, planned, applied, and checked through the actual installed vendor commands. Codex CLI `0.144.1` discovered one migrated MCP entry and Qoder CLI `1.1.42` discovered one migrated Skill; each result reported `expected_assets: 1`, `discovered_assets: 1`, `isolated_copy: true`, and `migrated_components_started: false`. All other cells remained explicit manual outcomes. The machine-readable snapshot is in [`compatibility.json`](compatibility.json).

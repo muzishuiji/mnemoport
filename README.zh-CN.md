@@ -9,7 +9,7 @@ MnemoPort 是面向个人 AI 资产的开源可移植层。它可以在 Codex、
 工具 X             ->  规范化资产模型     ->  工具 Y
 ```
 
-MnemoPort 当前是可从源码安装的 Alpha 版本。Rust CLI、签名加密包格式、事务式 Apply/Undo、四个离线 Adapter、四个轻量宿主 Skill，以及全部 16 条核心 Source→Target 冒烟路径均已实现并通过测试。原生自动记忆、账号/云端数据、插件联网安装和大范围偏好设置迁移仍有意保持为非自动操作。
+MnemoPort 当前是可以下载预发布二进制、也可以从源码安装的 Alpha 版本。Rust CLI、签名加密包格式、事务式 Apply/Undo、四个离线 Adapter、四个轻量宿主 Skill，以及全部 16 条核心 Source→Target 冒烟路径均已实现并通过测试。原生自动记忆、账号/云端数据、插件联网安装和大范围偏好设置迁移仍有意保持为非自动操作。
 
 MnemoPort 与模型供应商无关。它不会调用 LLM API，也不需要 OpenAI、Anthropic、DeepSeek 或其他模型供应商的 API Key。它在用户已经登录的 AI 编程工具中本地运行。`MNEMOPORT_PASSPHRASE` 只是用户为 `.mnemo` 包设置的加密口令，不是模型凭据。
 
@@ -37,7 +37,23 @@ MnemoPort 与模型供应商无关。它不会调用 LLM API，也不需要 Open
 - 用于克隆和更新源码仓库的 Git。
 - 不需要模型供应商 API Key。
 
-## 安装 CLI
+## 安装发布二进制
+
+从 [GitHub Releases](https://github.com/muzishuiji/mnemoport/releases) 下载适合当前平台的压缩包以及相邻的 `.sha256` 文件。Linux x86-64 示例：
+
+```bash
+version=v0.1.0-alpha.1
+curl -LO "https://github.com/muzishuiji/mnemoport/releases/download/$version/mnemoport-x86_64-unknown-linux-gnu.tar.gz"
+curl -LO "https://github.com/muzishuiji/mnemoport/releases/download/$version/mnemoport-x86_64-unknown-linux-gnu.tar.gz.sha256"
+sha256sum --check mnemoport-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf mnemoport-x86_64-unknown-linux-gnu.tar.gz
+install -m 0755 mnemo "$HOME/.local/bin/mnemo"
+mnemo --version
+```
+
+其他压缩包分别是 Apple Silicon macOS 使用的 `mnemoport-aarch64-apple-darwin.tar.gz`，以及 Windows x86-64 使用的 `mnemoport-x86_64-pc-windows-msvc.zip`。解压前先验证校验和，再把 `mnemo` 或 `mnemo.exe` 放到 `PATH` 中的目录。GitHub provenance 验证方式参见[发布安全](docs/release-security.md)。
+
+## 从源码安装 CLI
 
 克隆仓库并通过 Cargo 安装 `mnemo`：
 
@@ -132,6 +148,14 @@ mnemo apply --input claude-assets.mnemo --plan migration-plan.json --approve <ap
 mnemo verify --input claude-assets.mnemo --plan migration-plan.json --json
 ```
 
+默认验证级别是 L0。L0 通过后，可以为存在精确安全配方的版本请求原生发现验证：
+
+```bash
+mnemo verify --input claude-assets.mnemo --plan migration-plan.json --level l1 --json
+```
+
+L1 会为每种迁入资产输出结构化结果。当前版本可在 Linux 上自动发现 Codex CLI `0.144.1` 的 MCP 项和 Qoder CLI `1.1.42` 的 Skills；其他 tuple 或资产类型会明确返回 `manual`、`unsupported_version` 或 `unavailable`，并使用退出码 `2`。
+
 不要复用过期计划。如果目标文件在生成计划后发生变化，请换一个新的计划输出文件名并重新运行 `plan`。
 
 ### 跨设备或同工具迁移（X→X）
@@ -184,7 +208,7 @@ mnemo undo <migration-id> --json
 
 ### 进程中断恢复
 
-替换每个文件前，MnemoPort 都会先写入并同步回滚备份以及 `prepared` 日志。进程或设备中断后，`mnemo doctor --json` 会报告遗留的 prepared 事务。可以先进行只读检查：
+替换每个文件前，MnemoPort 都会先写入并同步回滚备份以及 `prepared` 日志。进程或设备中断后，`mnemo doctor --json` 也会识别已经写成 `committed`、但账本确认尚未完成的事务。可以先进行只读检查：
 
 ```bash
 mnemo recovery list --json
@@ -196,7 +220,7 @@ mnemo recovery list --json
 mnemo recovery rollback <transaction-id> --json
 ```
 
-恢复过程会验证日志位置和回滚备份哈希。当目标既不匹配迁移前状态，也不匹配迁移后状态时，会以 `manual-review` 拒绝操作，不会擅自覆盖外部修改。
+恢复过程会验证日志位置和回滚备份哈希。当目标既不匹配迁移前状态，也不匹配迁移后状态时，会以 `manual-review` 拒绝操作，不会擅自覆盖外部修改。账本事务与受管文件所有权会原子提交；撤销受管更新时恢复前一个所有者，撤销首次写入时删除本次创建的所有权。
 
 ### 显式产品探测
 
@@ -209,7 +233,7 @@ mnemo probe --platform cursor --json
 
 探测只会调用 Adapter 固定的 `--version` 参数，不经过 shell，也不使用任何资产派生输入。它会清除包含凭据的环境变量，提供一次性 Home，最多捕获 8 KiB 输出，五秒后终止子进程，随后删除临时目录，并且绝不初始化迁入的 Skill、MCP Server 或插件。结果按入口区分；缺少 CLI、不支持的 Desktop/GUI 入口、执行失败或超时都会产生明确状态和退出码 `2`。
 
-这只是版本级 L1 证据，并不能证明某项迁入资产已被目标产品发现。子进程没有被放入操作系统网络命名空间，因此只应对你信任的已安装可执行文件运行。精确边界参见[产品探测](docs/product-probes.md)。
+这只是版本级 L1 证据，并不能证明某项迁入资产已被目标产品发现。资产级 L1 需要通过 `mnemo verify --level l1` 单独请求；每个自动配方都使用固定参数、仅包含所需目标状态的一次性私有副本、超时、输出硬上限和结构化解析器，并且不会启动迁入的 MCP Server、Skill、插件或 Hook。子进程没有被放入操作系统网络命名空间，因此只应对你信任的已安装可执行文件运行。精确边界和兼容矩阵参见[产品探测](docs/product-probes.md)。
 
 ### 新会话 Handoff Capsule
 
@@ -236,7 +260,7 @@ mnemo handoff --input handoff.json --output handoff.mnemo --json
 | `mnemo trust add --input FILE` | 仅 MnemoPort 状态 | 信任一个已验证的来源设备签名身份 |
 | `mnemo trust list` | 否 | 列出本机信任的签名指纹 |
 | `mnemo apply --input FILE --plan PLAN --approve TOKEN` | 是 | 重新验证并以事务方式写入已批准的目标文件 |
-| `mnemo verify --input FILE --plan PLAN` | 否 | 重建预期 L0 内容并比较目标哈希 |
+| `mnemo verify --input FILE --plan PLAN [--level l0\|l1]` | 仅一次性 L1 探测状态 | 比较目标哈希，并可请求精确 tuple 的原生资产发现 |
 | `mnemo report ID` | 否 | 读取操作状态和日志数量 |
 | `mnemo undo MIGRATION_ID` | 是 | 恢复迁移后未被再次修改的目标 |
 | `mnemo recovery list` | 否 | 对中断后遗留的 prepared 日志进行分类 |
@@ -278,13 +302,13 @@ MnemoPort 只读取 Adapter 批准的路径以及当前 workspace。隔离测试
 - 来源盘点和提取只读，绝不启动来源产品。
 - `.mnemo` 内容具有确定性，使用 zstd 压缩、Ed25519 签名，并默认通过 age 加密。
 - 路径、符号链接、归档大小、签名、哈希、对象闭包和目标前置条件都会被验证。
-- Apply 使用已经同步到磁盘的本地备份、持久事务日志、SQLite 审计账本，并为本地文件提供强回滚。
+- Apply 使用已经同步到磁盘的本地备份、持久事务日志以及原子提交的 SQLite 事务/所有权更新，并为本地文件提供强回滚。
 - 保留目标中无关的已有内容；冲突绝不被静默覆盖。
 - 认证值、Cookies、系统钥匙串、内部数据库、信任决定和缓存均不迁移。
 - 在 inventory、inspect、plan 和默认 L0 验证过程中，不执行脚本、Hooks、插件或 MCP Server。
 - `--allow-plaintext` 仅用于用户明确确认不敏感的 fixture。真实个人资产不应使用该选项。
 
-当前 Alpha 尚不会执行插件/扩展联网安装、CLI 依赖安装、OAuth/账号导出、MCP Server 执行、原生自动记忆导入或大范围编辑器 Profile 同步。只有在 Adapter 能够安全处理时，才会记录或盘点这些表面。prepared 日志崩溃恢复和版本级 L1 探测已经实现；资产级原生发现、后续账本崩溃点以及首个公开二进制 tag 仍是发布门禁。仓库已经包含 SBOM/provenance 自动化，但只有带 tag 的工作流成功后，相关证明才适用于正式制品。
+当前 Alpha 不会执行插件/扩展联网安装、CLI 依赖安装、OAuth/账号导出、MCP Server 执行、原生自动记忆导入或大范围编辑器 Profile 同步。只有在 Adapter 能够安全处理时，才会记录或盘点这些表面。prepared 与已提交但未确认事务的崩溃恢复、原子受管所有权、版本级探测，以及上文两个精确 tuple 的资产级 L1 配方都已实现；矩阵之外的原生能力仍明确降级为手动处理。发布制品和 provenance 声明只有在带 tag 的工作流成功后才成立。
 
 ## 故障排查
 

@@ -3,7 +3,7 @@
 use directories::ProjectDirs;
 use ed25519_dalek::SigningKey;
 use mnemo_security::sha256_id;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
@@ -101,6 +101,14 @@ pub struct ManagedObjectRecord {
     pub source_asset_id: String,
 }
 
+/// Ownership state captured around one transactional file mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedObjectChange {
+    target_locator: String,
+    before: Option<ManagedObjectRecord>,
+    after: ManagedObjectRecord,
+}
+
 /// Explicitly trusted package signing identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedKeyRecord {
@@ -131,6 +139,16 @@ impl Ledger {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.execute_batch(SCHEMA)?;
+        Ok(Self { connection })
+    }
+
+    /// Open an existing ledger without creating files or applying migrations.
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Self { connection })
     }
 
@@ -232,6 +250,70 @@ impl Ledger {
         Ok(())
     }
 
+    /// Atomically record a committed file transaction and update ownership.
+    /// If SQLite commits but the caller stops before receiving success, the
+    /// durable transaction id still lets recovery distinguish it from an
+    /// unrecorded committed journal.
+    pub fn record_transaction_with_managed_object(
+        &self,
+        operation_id: &str,
+        journal: &FileTransactionJournal,
+        source_asset_id: &str,
+    ) -> Result<(), StoreError> {
+        self.record_transaction_with_managed_object_inner(
+            operation_id,
+            journal,
+            source_asset_id,
+            |_| Ok(()),
+        )
+    }
+
+    fn record_transaction_with_managed_object_inner(
+        &self,
+        operation_id: &str,
+        journal: &FileTransactionJournal,
+        source_asset_id: &str,
+        mut checkpoint: impl FnMut(LedgerCheckpoint) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        insert_transaction(&transaction, operation_id, journal)?;
+        checkpoint(LedgerCheckpoint::TransactionInserted)?;
+
+        let target_locator = journal.target.to_string_lossy().into_owned();
+        let before = managed_object_from_connection(&transaction, &target_locator)?;
+        let after = ManagedObjectRecord {
+            target_locator: target_locator.clone(),
+            owner_id: operation_id.to_owned(),
+            installed_hash: journal.after_hash.clone(),
+            source_asset_id: source_asset_id.to_owned(),
+        };
+        transaction.execute(
+            "INSERT INTO managed_object_changes(
+                transaction_id, target_locator,
+                before_owner_id, before_installed_hash, before_source_asset_id,
+                after_owner_id, after_installed_hash, after_source_asset_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                journal.id,
+                target_locator,
+                before.as_ref().map(|record| record.owner_id.as_str()),
+                before.as_ref().map(|record| record.installed_hash.as_str()),
+                before
+                    .as_ref()
+                    .map(|record| record.source_asset_id.as_str()),
+                after.owner_id,
+                after.installed_hash,
+                after.source_asset_id,
+            ],
+        )?;
+        checkpoint(LedgerCheckpoint::OwnershipChangeInserted)?;
+        upsert_managed_object(&transaction, &after)?;
+        checkpoint(LedgerCheckpoint::ManagedObjectUpdated)?;
+        transaction.commit()?;
+        checkpoint(LedgerCheckpoint::Committed)?;
+        Ok(())
+    }
+
     /// Return durable journal paths for an operation in creation order.
     pub fn transaction_journals(&self, operation_id: &str) -> Result<Vec<PathBuf>, StoreError> {
         let mut statement = self.connection.prepare(
@@ -258,6 +340,56 @@ impl Ledger {
                 "transaction {transaction_id}"
             )));
         }
+        Ok(())
+    }
+
+    /// Return whether a file transaction is durably indexed by the ledger.
+    pub fn has_transaction(&self, transaction_id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT 1 FROM transactions WHERE id = ?1",
+                [transaction_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Mark a transaction rolled back and restore its previous ownership state
+    /// in the same SQLite transaction.
+    pub fn rollback_transaction_and_managed_object(
+        &self,
+        transaction_id: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let change = managed_change(&transaction, transaction_id)?;
+        if let Some(change) = change {
+            let current = managed_object_from_connection(&transaction, &change.target_locator)?;
+            if current.as_ref() != Some(&change.after) {
+                return Err(StoreError::InvalidState(
+                    "managed ownership changed after the transaction".to_owned(),
+                ));
+            }
+            if let Some(before) = change.before {
+                upsert_managed_object(&transaction, &before)?;
+            } else {
+                transaction.execute(
+                    "DELETE FROM managed_objects WHERE target_locator = ?1",
+                    [&change.target_locator],
+                )?;
+            }
+        }
+        let changed = transaction.execute(
+            "UPDATE transactions SET status = ?1 WHERE id = ?2",
+            params![TransactionStatus::RolledBack.as_str(), transaction_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::NotFound(format!(
+                "transaction {transaction_id}"
+            )));
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -441,6 +573,10 @@ pub struct RecoveryCandidate {
     pub disposition: RecoveryDisposition,
     /// Durable journal used for explicit recovery.
     pub journal_path: PathBuf,
+    /// Durable state found in the file journal.
+    pub journal_status: TransactionStatus,
+    /// Whether the SQLite ledger already acknowledges this transaction.
+    pub ledger_recorded: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,6 +586,15 @@ enum ApplyCheckpoint {
     TargetTemporarySynced,
     TargetPersisted,
     TargetDirectorySynced,
+    CommittedJournalSynced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerCheckpoint {
+    TransactionInserted,
+    OwnershipChangeInserted,
+    ManagedObjectUpdated,
+    Committed,
 }
 
 /// Apply one recoverable file replacement.
@@ -544,6 +689,7 @@ fn apply_file_inner(
 
     journal.status = TransactionStatus::Committed;
     save_journal(&journal)?;
+    checkpoint(ApplyCheckpoint::CommittedJournalSynced)?;
     Ok(journal)
 }
 
@@ -581,6 +727,15 @@ pub fn load_journal(path: &Path) -> Result<FileTransactionJournal, StoreError> {
 pub fn scan_recovery_candidates(
     transaction_root: &Path,
 ) -> Result<Vec<RecoveryCandidate>, StoreError> {
+    scan_recovery_candidates_with_ledger(transaction_root, None)
+}
+
+/// Find interrupted prepared journals and committed journals that were never
+/// durably indexed by the supplied ledger.
+pub fn scan_recovery_candidates_with_ledger(
+    transaction_root: &Path,
+    ledger: Option<&Ledger>,
+) -> Result<Vec<RecoveryCandidate>, StoreError> {
     let entries = match fs::read_dir(transaction_root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -600,8 +755,14 @@ pub fn scan_recovery_candidates(
             Err(error) => return Err(error),
         };
         validate_recovery_journal(transaction_root, &journal_path, &journal)?;
-        if journal.status == TransactionStatus::Prepared {
-            candidates.push(classify_recovery(&journal));
+        let ledger_recorded = match ledger {
+            Some(ledger) => ledger.has_transaction(&journal.id)?,
+            None => false,
+        };
+        if journal.status == TransactionStatus::Prepared
+            || (journal.status == TransactionStatus::Committed && !ledger_recorded)
+        {
+            candidates.push(classify_recovery(&journal, ledger_recorded));
         }
     }
     candidates.sort_by(|left, right| left.transaction_id.cmp(&right.transaction_id));
@@ -612,6 +773,17 @@ pub fn scan_recovery_candidates(
 pub fn rollback_prepared_transaction(
     transaction_root: &Path,
     transaction_id: &str,
+) -> Result<FileTransactionJournal, StoreError> {
+    rollback_recoverable_transaction(transaction_root, transaction_id, None)
+}
+
+/// Roll back a prepared transaction or an orphan committed journal. A
+/// committed journal already present in the ledger is never treated as an
+/// orphan and must go through normal migration undo.
+pub fn rollback_recoverable_transaction(
+    transaction_root: &Path,
+    transaction_id: &str,
+    ledger: Option<&Ledger>,
 ) -> Result<FileTransactionJournal, StoreError> {
     let parsed = Uuid::parse_str(transaction_id)
         .map_err(|_| StoreError::InvalidState("invalid recovery transaction id".to_owned()))?;
@@ -624,13 +796,26 @@ pub fn rollback_prepared_transaction(
     reject_symlink_ancestors(&journal_path)?;
     let mut journal = load_journal(&journal_path)?;
     validate_recovery_journal(transaction_root, &journal_path, &journal)?;
-    if journal.status != TransactionStatus::Prepared {
+    let ledger_recorded = match ledger {
+        Some(ledger) => ledger.has_transaction(&journal.id)?,
+        None => false,
+    };
+    if journal.status == TransactionStatus::Committed && ledger_recorded {
+        return Err(StoreError::InvalidState(format!(
+            "transaction {} is committed and recorded; use migration undo",
+            journal.id
+        )));
+    }
+    if !matches!(
+        journal.status,
+        TransactionStatus::Prepared | TransactionStatus::Committed
+    ) {
         return Err(StoreError::InvalidState(format!(
             "transaction {} is not awaiting recovery",
             journal.id
         )));
     }
-    let candidate = classify_recovery(&journal);
+    let candidate = classify_recovery(&journal, ledger_recorded);
     match candidate.disposition {
         RecoveryDisposition::MarkRolledBack => {}
         RecoveryDisposition::RestoreBackup => restore_before(&journal)?,
@@ -646,7 +831,7 @@ pub fn rollback_prepared_transaction(
     Ok(journal)
 }
 
-fn classify_recovery(journal: &FileTransactionJournal) -> RecoveryCandidate {
+fn classify_recovery(journal: &FileTransactionJournal, ledger_recorded: bool) -> RecoveryCandidate {
     let current_hash = fs::read(&journal.target)
         .ok()
         .map(|bytes| sha256_id(&bytes));
@@ -665,7 +850,129 @@ fn classify_recovery(journal: &FileTransactionJournal) -> RecoveryCandidate {
         current_hash,
         disposition,
         journal_path: journal.journal_path.clone(),
+        journal_status: journal.status,
+        ledger_recorded,
     }
+}
+
+fn insert_transaction(
+    connection: &Transaction<'_>,
+    operation_id: &str,
+    journal: &FileTransactionJournal,
+) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO transactions(
+            id, operation_id, status, target_locator, before_hash, after_hash,
+            backup_locator, journal_locator, created_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            journal.id,
+            operation_id,
+            journal.status.as_str(),
+            journal.target.to_string_lossy(),
+            journal.before_hash,
+            journal.after_hash,
+            journal
+                .backup
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            journal.journal_path.to_string_lossy(),
+            journal.created_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn managed_object_from_connection(
+    connection: &Transaction<'_>,
+    target_locator: &str,
+) -> Result<Option<ManagedObjectRecord>, StoreError> {
+    Ok(connection
+        .query_row(
+            "SELECT target_locator, owner_id, installed_hash, source_asset_id
+             FROM managed_objects WHERE target_locator = ?1",
+            [target_locator],
+            |row| {
+                Ok(ManagedObjectRecord {
+                    target_locator: row.get(0)?,
+                    owner_id: row.get(1)?,
+                    installed_hash: row.get(2)?,
+                    source_asset_id: row.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn managed_change(
+    connection: &Transaction<'_>,
+    transaction_id: &str,
+) -> Result<Option<ManagedObjectChange>, StoreError> {
+    Ok(connection
+        .query_row(
+            "SELECT target_locator,
+                    before_owner_id, before_installed_hash, before_source_asset_id,
+                    after_owner_id, after_installed_hash, after_source_asset_id
+             FROM managed_object_changes WHERE transaction_id = ?1",
+            [transaction_id],
+            |row| {
+                let target_locator = row.get::<_, String>(0)?;
+                let before_owner_id = row.get::<_, Option<String>>(1)?;
+                let before_installed_hash = row.get::<_, Option<String>>(2)?;
+                let before_source_asset_id = row.get::<_, Option<String>>(3)?;
+                let before = match (
+                    before_owner_id,
+                    before_installed_hash,
+                    before_source_asset_id,
+                ) {
+                    (Some(owner_id), Some(installed_hash), Some(source_asset_id)) => {
+                        Some(ManagedObjectRecord {
+                            target_locator: target_locator.clone(),
+                            owner_id,
+                            installed_hash,
+                            source_asset_id,
+                        })
+                    }
+                    (None, None, None) => None,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                Ok(ManagedObjectChange {
+                    before,
+                    after: ManagedObjectRecord {
+                        target_locator: target_locator.clone(),
+                        owner_id: row.get(4)?,
+                        installed_hash: row.get(5)?,
+                        source_asset_id: row.get(6)?,
+                    },
+                    target_locator,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn upsert_managed_object(
+    connection: &Transaction<'_>,
+    record: &ManagedObjectRecord,
+) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO managed_objects(
+            target_locator, owner_id, installed_hash, source_asset_id, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(target_locator) DO UPDATE SET
+            owner_id = excluded.owner_id,
+            installed_hash = excluded.installed_hash,
+            source_asset_id = excluded.source_asset_id,
+            updated_at_ms = excluded.updated_at_ms",
+        params![
+            record.target_locator,
+            record.owner_id,
+            record.installed_hash,
+            record.source_asset_id,
+            unix_millis()?,
+        ],
+    )?;
+    Ok(())
 }
 
 fn validate_recovery_journal(
@@ -995,6 +1302,21 @@ CREATE TABLE IF NOT EXISTS managed_objects (
   source_asset_id TEXT NOT NULL,
   updated_at_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS managed_object_changes (
+  transaction_id TEXT PRIMARY KEY REFERENCES transactions(id),
+  target_locator TEXT NOT NULL,
+  before_owner_id TEXT,
+  before_installed_hash TEXT,
+  before_source_asset_id TEXT,
+  after_owner_id TEXT NOT NULL,
+  after_installed_hash TEXT NOT NULL,
+  after_source_asset_id TEXT NOT NULL,
+  CHECK (
+    (before_owner_id IS NULL AND before_installed_hash IS NULL AND before_source_asset_id IS NULL)
+    OR
+    (before_owner_id IS NOT NULL AND before_installed_hash IS NOT NULL AND before_source_asset_id IS NOT NULL)
+  )
+);
 CREATE TABLE IF NOT EXISTS trusted_keys (
   fingerprint TEXT PRIMARY KEY,
   public_key TEXT NOT NULL,
@@ -1012,9 +1334,10 @@ CREATE TABLE IF NOT EXISTS capability_snapshots (
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplyCheckpoint, Ledger, OperationStatus, RecoveryDisposition, StoreError, apply_file,
-        apply_file_with_fault, load_journal, rollback_prepared_transaction,
-        scan_recovery_candidates, undo_file,
+        ApplyCheckpoint, Ledger, LedgerCheckpoint, OperationStatus, RecoveryDisposition,
+        StoreError, TransactionStatus, apply_file, apply_file_with_fault, load_journal,
+        rollback_prepared_transaction, rollback_recoverable_transaction, scan_recovery_candidates,
+        scan_recovery_candidates_with_ledger, undo_file,
     };
 
     #[test]
@@ -1124,6 +1447,153 @@ mod tests {
             rollback_prepared_transaction(&transactions, &candidates[0].transaction_id)?;
             assert_eq!(std::fs::read(&target)?, b"before");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_finds_a_committed_journal_missing_from_the_ledger()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let target = root.join("settings.json");
+        let transactions = root.join("transactions");
+        std::fs::write(&target, b"before")?;
+        let result = apply_file_with_fault(
+            &target,
+            b"after",
+            &transactions,
+            Some(&mnemo_security::sha256_id(b"before")),
+            ApplyCheckpoint::CommittedJournalSynced,
+        );
+        assert!(matches!(result, Err(StoreError::InvalidState(_))));
+        assert_eq!(std::fs::read(&target)?, b"after");
+
+        let ledger = Ledger::in_memory()?;
+        let candidates = scan_recovery_candidates_with_ledger(&transactions, Some(&ledger))?;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].journal_status, TransactionStatus::Committed);
+        assert!(!candidates[0].ledger_recorded);
+        assert_eq!(
+            candidates[0].disposition,
+            RecoveryDisposition::RestoreBackup
+        );
+        rollback_recoverable_transaction(
+            &transactions,
+            &candidates[0].transaction_id,
+            Some(&ledger),
+        )?;
+        assert_eq!(std::fs::read(&target)?, b"before");
+        Ok(())
+    }
+
+    #[test]
+    fn ledger_record_faults_before_commit_leave_no_partial_ownership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for failure_point in [
+            LedgerCheckpoint::TransactionInserted,
+            LedgerCheckpoint::OwnershipChangeInserted,
+            LedgerCheckpoint::ManagedObjectUpdated,
+        ] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().canonicalize()?;
+            let target = root.join("asset.md");
+            let journal = apply_file(&target, b"asset", &root.join("transactions"), None)?;
+            let ledger = Ledger::in_memory()?;
+            let operation = ledger.begin_operation("apply", &serde_json::json!({}))?;
+            let result = ledger.record_transaction_with_managed_object_inner(
+                &operation,
+                &journal,
+                "asset-a",
+                |checkpoint| {
+                    if checkpoint == failure_point {
+                        Err(StoreError::InvalidState(format!(
+                            "injected ledger failure at {checkpoint:?}"
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(result, Err(StoreError::InvalidState(_))));
+            assert!(!ledger.has_transaction(&journal.id)?);
+            assert!(ledger.managed_object(&target.to_string_lossy())?.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ledger_commit_ack_failure_remains_a_reversible_managed_transaction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let target = root.join("asset.md");
+        let mut journal = apply_file(&target, b"asset", &root.join("transactions"), None)?;
+        let ledger = Ledger::in_memory()?;
+        let operation = ledger.begin_operation("apply", &serde_json::json!({}))?;
+        let result = ledger.record_transaction_with_managed_object_inner(
+            &operation,
+            &journal,
+            "asset-a",
+            |checkpoint| {
+                if checkpoint == LedgerCheckpoint::Committed {
+                    Err(StoreError::InvalidState(
+                        "injected failure after ledger commit".to_owned(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(result, Err(StoreError::InvalidState(_))));
+        assert!(ledger.has_transaction(&journal.id)?);
+        assert!(ledger.managed_object(&target.to_string_lossy())?.is_some());
+        undo_file(&mut journal, false)?;
+        ledger.rollback_transaction_and_managed_object(&journal.id)?;
+        assert!(!target.exists());
+        assert!(ledger.managed_object(&target.to_string_lossy())?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn managed_update_undo_restores_the_previous_owner() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let target = root.join("asset.md");
+        let transactions = root.join("transactions");
+        let ledger = Ledger::in_memory()?;
+
+        let first_operation = ledger.begin_operation("apply", &serde_json::json!({}))?;
+        let first = apply_file(&target, b"first", &transactions, None)?;
+        ledger.record_transaction_with_managed_object(&first_operation, &first, "asset-first")?;
+
+        let second_operation = ledger.begin_operation("apply", &serde_json::json!({}))?;
+        let mut second = apply_file(
+            &target,
+            b"second",
+            &transactions,
+            Some(&mnemo_security::sha256_id(b"first")),
+        )?;
+        ledger.record_transaction_with_managed_object(
+            &second_operation,
+            &second,
+            "asset-second",
+        )?;
+        assert_eq!(
+            ledger
+                .managed_object(&target.to_string_lossy())?
+                .ok_or("managed object missing")?
+                .source_asset_id,
+            "asset-second"
+        );
+
+        undo_file(&mut second, false)?;
+        ledger.rollback_transaction_and_managed_object(&second.id)?;
+        let restored = ledger
+            .managed_object(&target.to_string_lossy())?
+            .ok_or("previous owner missing")?;
+        assert_eq!(restored.owner_id, first_operation);
+        assert_eq!(restored.installed_hash, mnemo_security::sha256_id(b"first"));
+        assert_eq!(restored.source_asset_id, "asset-first");
         Ok(())
     }
 

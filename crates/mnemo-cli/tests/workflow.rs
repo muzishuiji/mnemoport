@@ -145,6 +145,16 @@ fn encrypted_cross_device_export_plan_apply_and_undo() -> Result<(), Box<dyn std
             .join(".agents/skills/portable/SKILL.md")
             .is_file()
     );
+    let ledger = mnemo_store::Ledger::open_read_only(&target_state.join("data/ledger.sqlite"))?;
+    for managed_path in [
+        target_workspace.join("AGENTS.md"),
+        target_workspace.join(".agents/skills/portable/SKILL.md"),
+    ] {
+        let managed = ledger
+            .managed_object(&managed_path.to_string_lossy())?
+            .ok_or("migrated target is missing ownership evidence")?;
+        assert_eq!(managed.owner_id, migration_id);
+    }
 
     let verified = run(
         &target_workspace,
@@ -166,6 +176,42 @@ fn encrypted_cross_device_export_plan_apply_and_undo() -> Result<(), Box<dyn std
     assert_eq!(verify_json["data"]["level"], "l0");
     assert_eq!(verify_json["data"]["files_verified"], 2);
     assert_eq!(verify_json["data"]["signer_trusted"], true);
+
+    let l1 = run(
+        &target_workspace,
+        &target_state,
+        &[
+            "verify",
+            "--input",
+            package.to_str().ok_or("package path is not UTF-8")?,
+            "--plan",
+            plan.to_str().ok_or("plan path is not UTF-8")?,
+            "--level",
+            "l1",
+            "--json",
+        ],
+        &[
+            ("CODEX_HOME", &target_config),
+            ("MNEMOPORT_PASSPHRASE", Path::new(passphrase)),
+        ],
+    )?;
+    assert_eq!(l1.status.code(), Some(2));
+    let l1_json: Value = serde_json::from_slice(&l1.stdout)?;
+    assert_eq!(l1_json["data"]["level"], "l1");
+    assert_eq!(
+        l1_json["data"]["asset_discovery"]
+            .as_array()
+            .ok_or("asset discovery report missing")?
+            .len(),
+        2
+    );
+    assert!(
+        l1_json["data"]["asset_discovery"]
+            .as_array()
+            .ok_or("asset discovery report missing")?
+            .iter()
+            .all(|item| item["status"] == "manual")
+    );
 
     let reported = run(
         &target_workspace,
@@ -191,6 +237,21 @@ fn encrypted_cross_device_export_plan_apply_and_undo() -> Result<(), Box<dyn std
         !target_workspace
             .join(".agents/skills/portable/SKILL.md")
             .exists()
+    );
+    let ledger = mnemo_store::Ledger::open_read_only(&target_state.join("data/ledger.sqlite"))?;
+    assert!(
+        ledger
+            .managed_object(&target_workspace.join("AGENTS.md").to_string_lossy())?
+            .is_none()
+    );
+    assert!(
+        ledger
+            .managed_object(
+                &target_workspace
+                    .join(".agents/skills/portable/SKILL.md")
+                    .to_string_lossy()
+            )?
+            .is_none()
     );
     Ok(())
 }

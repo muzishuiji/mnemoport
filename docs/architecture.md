@@ -19,14 +19,14 @@ The Rust core owns deterministic schemas, path and content policy, package verif
 3. `export` extracts supported assets, removes credential values, signs, compresses, and encrypts one `.mnemo` file.
 4. `inspect` decrypts and verifies the package without target writes.
 5. `plan` renders against the exact target tuple and snapshots current target hashes.
-6. `apply` rebuilds the plan, rejects drift, then commits local files with journals and backups.
-7. `verify` independently rebuilds L0 target bytes and checks current target hashes.
+6. `apply` rebuilds the plan, rejects drift, then commits local files with journals and backups; its ledger transaction and managed-object ownership update are atomic.
+7. `verify` independently rebuilds L0 target bytes and checks current target hashes. With `--level l1`, it may then run an exact-tuple native discovery recipe against a disposable clone.
 8. `report` reads operation and journal evidence from the local ledger.
 9. `undo` restores only unchanged post-apply targets.
 
-If a process stops between a synced `prepared` journal and its final `committed` journal, `doctor` and `recovery list` classify the target from exact before/current/after hashes. `recovery rollback` restores a verified backup or closes a transaction whose target never changed. A third state is reported as manual review and never changed automatically.
+If a process stops between a synced `prepared` journal and its final `committed` journal—or after that commit but before the ledger acknowledgement—`doctor` and `recovery list` classify the target from exact before/current/after hashes and ledger presence. `recovery rollback` restores a verified backup or closes a transaction whose target never changed. A third state is reported as manual review and never changed automatically. Undo reverses the managed-object ownership change together with the transaction: a prior owner is restored for an update, while ownership first created by the undone migration is removed.
 
-Product discovery is also split by effect. `detect` only resolves files and executables. The explicit `probe` path runs a bounded adapter-owned `--version` command in a disposable home and records entrypoint-specific version evidence. It does not initialize migrated components, and its success cannot be promoted to asset-level discovery evidence.
+Product discovery is also split by effect. `detect` only resolves files and executables. The explicit `probe` path runs a bounded adapter-owned `--version` command in a disposable home and records entrypoint-specific version evidence. Asset-level L1 uses a separate fixed-command recipe, structured parser, timeout, hard output limit, and disposable copy of only the required target state. Neither path initializes migrated components, and version success cannot be promoted to asset-level discovery evidence.
 
 For same-tool moves between devices, `handoff` packages a user-selected new-session capsule using the same signing and encryption path. The destination receives a Markdown sidecar; MnemoPort never injects a private session database.
 

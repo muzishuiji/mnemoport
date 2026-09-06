@@ -304,11 +304,24 @@ pub fn merge_mcp_toml(
             path: PathBuf::from("config.toml"),
             message: error.to_string(),
         })?;
-    if document
+    if let Some(current) = document
         .get("mcp_servers")
         .and_then(toml::Value::as_table)
-        .is_some_and(|servers| servers.contains_key(&server.name))
+        .and_then(|servers| servers.get(&server.name))
     {
+        let marker = extracted
+            .asset
+            .asset_id
+            .strip_prefix("sha256:")
+            .unwrap_or(&extracted.asset.asset_id);
+        let start_marker = format!("# >>> mnemoport:{marker}");
+        let end_marker = format!("# <<< mnemoport:{marker}");
+        if text.contains(&start_marker)
+            && text.contains(&end_marker)
+            && mcp_toml_value_matches(current, server)
+        {
+            return Ok(existing.to_vec());
+        }
         return Err(AdapterError::InvalidData {
             path: PathBuf::from("config.toml"),
             message: format!("target MCP name collision: {}", server.name),
@@ -366,6 +379,46 @@ pub fn merge_mcp_toml(
         message: format!("rendered MCP TOML is invalid: {error}"),
     })?;
     Ok(output)
+}
+
+fn mcp_toml_value_matches(current: &toml::Value, server: &McpServerAsset) -> bool {
+    let Some(table) = current.as_table() else {
+        return false;
+    };
+    let expected_keys = [
+        server.command.as_ref().map(|_| "command"),
+        (!server.args.is_empty()).then_some("args"),
+        server.url.as_ref().map(|_| "url"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<std::collections::BTreeSet<_>>();
+    if table
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>()
+        != expected_keys
+    {
+        return false;
+    }
+    if table.get("command").and_then(toml::Value::as_str) != server.command.as_deref() {
+        return false;
+    }
+    let current_args = table
+        .get("args")
+        .and_then(toml::Value::as_array)
+        .and_then(|values| {
+            values
+                .iter()
+                .map(toml::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+        });
+    let expected_args = (!server.args.is_empty())
+        .then(|| server.args.iter().map(String::as_str).collect::<Vec<_>>());
+    if current_args != expected_args {
+        return false;
+    }
+    table.get("url").and_then(toml::Value::as_str) == server.url.as_deref()
 }
 
 fn mcp_json_value(server: &McpServerAsset) -> serde_json::Value {
@@ -1622,6 +1675,8 @@ http_headers = { X-Tenant = "private-value" }
         let prefix = b"# keep this comment\npersonality = \"pragmatic\"\n";
         let merged = merge_mcp_toml(Some(prefix), &extracted[0])?;
         assert!(merged.starts_with(prefix));
+        let reapplied = merge_mcp_toml(Some(&merged), &extracted[0])?;
+        assert_eq!(reapplied, merged);
         let text = String::from_utf8(merged)?;
         assert!(text.contains("reauth-required"));
         assert!(!text.contains("private-value"));

@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-adapter-claude-code"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "mnemo-adapter-common",
  "mnemo-schema",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-adapter-codex"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "mnemo-adapter-common",
  "mnemo-schema",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-adapter-common"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "directories",
  "mnemo-schema",
@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-adapter-cursor"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "mnemo-adapter-common",
  "mnemo-schema",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-adapter-qoder"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "mnemo-adapter-common",
  "mnemo-schema",
@@ -1191,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-cli"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "age",
  "anyhow",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "ed25519-dalek",
  "mnemo-adapter-claude-code",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-package"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "age",
  "ed25519-dalek",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-schema"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-security"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "hex",
  "regex",
@@ -1267,7 +1267,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-store"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "directories",
  "ed25519-dalek",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-testkit"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "tempfile",
 ]

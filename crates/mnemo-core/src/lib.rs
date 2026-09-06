@@ -11,17 +11,25 @@ use mnemo_adapter_cursor::CursorAdapter;
 use mnemo_adapter_qoder::QoderAdapter;
 use mnemo_package::{PackageBuilder, PackageError, SignedPackage, VerifiedPackage};
 use mnemo_schema::{
-    ApplyPhase, ApprovalClass, AssetKind, AssetPayload, MigrationPlan, PlanOperation,
-    PlanOperationKind, PlanPrecondition, Platform, ProductProbe, ProductTuple, RollbackGuarantee,
+    ApplyPhase, ApprovalClass, AssetKind, AssetPayload, AssetProbe, AssetProbeMethod,
+    AssetProbeStatus, Entrypoint, MigrationPlan, PlanOperation, PlanOperationKind,
+    PlanPrecondition, Platform, ProbeStatus, ProductProbe, ProductTuple, RollbackGuarantee,
     Sensitivity,
 };
 use mnemo_security::{FindingSeverity, scan_and_redact, sha256_id, validate_portable_path};
-use mnemo_store::{RecoveryCandidate, StatePaths, resolve_state_paths, scan_recovery_candidates};
+use mnemo_store::{
+    Ledger, RecoveryCandidate, StatePaths, resolve_state_paths,
+    scan_recovery_candidates_with_ledger,
+};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Build metadata and read-only environment status.
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +63,9 @@ pub enum CoreError {
     /// Local state or transaction recovery inspection failed.
     #[error(transparent)]
     Store(#[from] mnemo_store::StoreError),
+    /// Local read-only verification or disposable staging I/O failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     /// Package object graph is incomplete or inconsistent.
     #[error("invalid migration bundle: {0}")]
     InvalidBundle(String),
@@ -112,6 +123,8 @@ pub struct TargetRoots {
 pub struct PreparedFile {
     /// Source or combined asset identity.
     pub asset_id: String,
+    /// Canonical kind used by asset-level verification routing.
+    pub asset_kind: AssetKind,
     /// Logical root.
     pub root: String,
     /// Portable path relative to the logical root.
@@ -296,6 +309,19 @@ pub fn prepare_migration(
     roots: &TargetRoots,
     assets: &[ExtractedAsset],
 ) -> Result<PreparedMigration, CoreError> {
+    prepare_migration_with_managed(target, roots, assets, &BTreeMap::new())
+}
+
+/// Render and plan assets using durable ownership hashes from the target
+/// ledger. Only an unchanged MnemoPort-managed target is eligible for an
+/// automatic managed update.
+#[allow(clippy::too_many_lines)]
+pub fn prepare_migration_with_managed(
+    target: ProductTuple,
+    roots: &TargetRoots,
+    assets: &[ExtractedAsset],
+    managed_hashes: &BTreeMap<String, String>,
+) -> Result<PreparedMigration, CoreError> {
     let mut prepared = BTreeMap::<PathBuf, PreparedFile>::new();
     let mut skipped = Vec::new();
     for asset in assets {
@@ -335,6 +361,7 @@ pub fn prepare_migration(
                         target_path.clone(),
                         PreparedFile {
                             asset_id: combined_id,
+                            asset_kind: asset.asset.kind,
                             root: target_root_name(file.root).to_owned(),
                             relative_path: file.relative_path,
                             target_path,
@@ -358,6 +385,7 @@ pub fn prepare_migration(
                 target_path.clone(),
                 PreparedFile {
                     asset_id: file.asset_id,
+                    asset_kind: asset.asset.kind,
                     root: target_root_name(file.root).to_owned(),
                     relative_path: file.relative_path,
                     target_path,
@@ -390,7 +418,9 @@ pub fn prepare_migration(
                 target: TargetObservation {
                     locator: file.target_path.to_string_lossy().into_owned(),
                     current_hash,
-                    managed_hash: None,
+                    managed_hash: managed_hashes
+                        .get(&file.target_path.to_string_lossy().into_owned())
+                        .cloned(),
                 },
                 conflict_policy: ConflictPolicy::Preserve,
             }
@@ -519,6 +549,470 @@ pub fn probe(platform: Option<Platform>) -> Result<Vec<ProductProbe>, CoreError>
         }
     }
     Ok(reports)
+}
+
+/// Run admitted asset-level L1 discovery recipes. Unsupported tuples are
+/// returned as explicit manual/version-gated results and never fall back to
+/// launching a model, MCP server, plugin, hook, or migrated script.
+pub fn verify_asset_discovery(
+    target: &ProductTuple,
+    roots: &TargetRoots,
+    assets: &[ExtractedAsset],
+    prepared: &PreparedMigration,
+) -> Result<Vec<AssetProbe>, CoreError> {
+    let mut by_kind = BTreeMap::<AssetKind, BTreeSet<String>>::new();
+    for file in &prepared.files {
+        by_kind
+            .entry(file.asset_kind)
+            .or_default()
+            .insert(file.asset_id.clone());
+    }
+    let version_probe = probe(Some(target.platform))?.into_iter().find(|report| {
+        report.tuple.entrypoint == target.entrypoint
+            && report.tuple.config_root == target.config_root
+    });
+    let tuple = version_probe
+        .as_ref()
+        .map_or_else(|| target.clone(), |report| report.tuple.clone());
+
+    let mut reports = Vec::with_capacity(by_kind.len());
+    for (asset_kind, asset_ids) in by_kind {
+        let expected_assets = asset_ids.len();
+        let unavailable = version_probe
+            .as_ref()
+            .is_none_or(|report| report.status == ProbeStatus::Unavailable);
+        let version_failed = version_probe
+            .as_ref()
+            .is_some_and(|report| report.status != ProbeStatus::Verified);
+        let report = match (tuple.platform, &tuple.entrypoint, asset_kind) {
+            (Platform::Codex, Entrypoint::Cli, AssetKind::Mcp)
+                if tuple.version.as_deref() == Some("0.144.1") && tuple.os == "linux" =>
+            {
+                verify_codex_mcp(&tuple, roots, assets, prepared)?
+            }
+            (Platform::Qoder, Entrypoint::Cli, AssetKind::Skill)
+                if tuple.version.as_deref() == Some("1.1.42") && tuple.os == "linux" =>
+            {
+                verify_qoder_skills(&tuple, prepared)?
+            }
+            (Platform::Codex, _, AssetKind::Mcp) | (Platform::Qoder, _, AssetKind::Skill)
+                if unavailable || version_failed || tuple.version.is_none() =>
+            {
+                asset_probe_result(
+                    tuple.clone(),
+                    asset_kind,
+                    if unavailable {
+                        AssetProbeStatus::Unavailable
+                    } else {
+                        AssetProbeStatus::UnsupportedVersion
+                    },
+                    AssetProbeMethod::None,
+                    Vec::new(),
+                    "asset_recipe_requires_an_exact_verified_tuple",
+                    expected_assets,
+                    0,
+                    false,
+                )
+            }
+            (Platform::Codex, _, AssetKind::Mcp) | (Platform::Qoder, _, AssetKind::Skill) => {
+                asset_probe_result(
+                    tuple.clone(),
+                    asset_kind,
+                    AssetProbeStatus::UnsupportedVersion,
+                    AssetProbeMethod::None,
+                    Vec::new(),
+                    "asset_recipe_not_admitted_for_this_version_os_or_entrypoint",
+                    expected_assets,
+                    0,
+                    false,
+                )
+            }
+            _ => asset_probe_result(
+                tuple.clone(),
+                asset_kind,
+                AssetProbeStatus::Manual,
+                AssetProbeMethod::None,
+                Vec::new(),
+                "no_safe_authoritative_discovery_surface",
+                expected_assets,
+                0,
+                false,
+            ),
+        };
+        reports.push(report);
+    }
+    Ok(reports)
+}
+
+fn verify_codex_mcp(
+    tuple: &ProductTuple,
+    roots: &TargetRoots,
+    assets: &[ExtractedAsset],
+    prepared: &PreparedMigration,
+) -> Result<AssetProbe, CoreError> {
+    let expected = expected_codex_mcp_names(assets, prepared);
+    let Some(executable) = tuple.executable.as_deref() else {
+        return Ok(asset_probe_result(
+            tuple.clone(),
+            AssetKind::Mcp,
+            AssetProbeStatus::Unavailable,
+            AssetProbeMethod::None,
+            Vec::new(),
+            "executable_unavailable",
+            expected.len(),
+            0,
+            false,
+        ));
+    };
+    let scratch = tempfile::tempdir()?;
+    let clone_config = scratch.path().join("codex-home");
+    let clone_workspace = scratch.path().join("workspace");
+    let clone_home = scratch.path().join("home");
+    fs::create_dir_all(&clone_config)?;
+    fs::create_dir_all(&clone_workspace)?;
+    fs::create_dir_all(&clone_home)?;
+    copy_if_present(
+        &roots.product_config.join("config.toml"),
+        &clone_config.join("config.toml"),
+    )?;
+    copy_if_present(
+        &roots.workspace.join(".codex/config.toml"),
+        &clone_workspace.join(".codex/config.toml"),
+    )?;
+    let arguments = ["mcp", "list", "--json"];
+    let execution = run_fixed_vendor_command(
+        executable,
+        &arguments,
+        &[
+            ("HOME", clone_home.as_path()),
+            ("USERPROFILE", clone_home.as_path()),
+            ("CODEX_HOME", clone_config.as_path()),
+        ],
+        &clone_workspace,
+        scratch.path(),
+        Duration::from_secs(10),
+    )?;
+    let (status, discovered, diagnostic) = match execution {
+        FixedCommandResult::Completed {
+            success: true,
+            output,
+        } => match parse_codex_mcp_names(&output) {
+            Some(names) => {
+                let discovered = expected.intersection(&names).count();
+                if discovered == expected.len() {
+                    (
+                        AssetProbeStatus::Verified,
+                        discovered,
+                        "all_assets_discovered",
+                    )
+                } else {
+                    (
+                        AssetProbeStatus::Failed,
+                        discovered,
+                        "expected_asset_not_discovered",
+                    )
+                }
+            }
+            None => (AssetProbeStatus::Failed, 0, "vendor_output_unrecognized"),
+        },
+        FixedCommandResult::Completed { success: false, .. } => {
+            (AssetProbeStatus::Failed, 0, "vendor_list_command_failed")
+        }
+        FixedCommandResult::TimedOut => {
+            (AssetProbeStatus::Failed, 0, "vendor_list_command_timed_out")
+        }
+        FixedCommandResult::OutputLimitExceeded => {
+            (AssetProbeStatus::Failed, 0, "vendor_output_limit_exceeded")
+        }
+    };
+    Ok(asset_probe_result(
+        tuple.clone(),
+        AssetKind::Mcp,
+        status,
+        AssetProbeMethod::VendorListCommand,
+        arguments.iter().map(ToString::to_string).collect(),
+        diagnostic,
+        expected.len(),
+        discovered,
+        true,
+    ))
+}
+
+fn expected_codex_mcp_names(
+    assets: &[ExtractedAsset],
+    prepared: &PreparedMigration,
+) -> BTreeSet<String> {
+    let migrated_ids = prepared
+        .files
+        .iter()
+        .filter(|file| file.asset_kind == AssetKind::Mcp)
+        .map(|file| file.asset_id.as_str())
+        .collect::<BTreeSet<_>>();
+    assets
+        .iter()
+        .filter_map(|asset| match &asset.asset.payload {
+            AssetPayload::McpServer(server)
+                if asset.asset.sensitivity != Sensitivity::Quarantined
+                    && migrated_ids.contains(asset.asset.asset_id.as_str()) =>
+            {
+                Some(server.name.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn copy_if_present(source: &Path, destination: &Path) -> Result<(), CoreError> {
+    match fs::read(source) {
+        Ok(bytes) => {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(destination, bytes)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn verify_qoder_skills(
+    tuple: &ProductTuple,
+    prepared: &PreparedMigration,
+) -> Result<AssetProbe, CoreError> {
+    let Some(executable) = tuple.executable.as_deref() else {
+        return Ok(asset_probe_result(
+            tuple.clone(),
+            AssetKind::Skill,
+            AssetProbeStatus::Unavailable,
+            AssetProbeMethod::None,
+            Vec::new(),
+            "executable_unavailable",
+            0,
+            0,
+            true,
+        ));
+    };
+    let scratch = tempfile::tempdir()?;
+    let clone_config = scratch.path().join("qoder-config");
+    let clone_workspace = scratch.path().join("workspace");
+    let clone_home = scratch.path().join("home");
+    fs::create_dir_all(&clone_config)?;
+    fs::create_dir_all(&clone_workspace)?;
+    fs::create_dir_all(&clone_home)?;
+    let mut expected = BTreeSet::new();
+    for file in prepared.files.iter().filter(|file| {
+        file.asset_kind == AssetKind::Skill && file.relative_path.ends_with("SKILL.md")
+    }) {
+        let destination = match file.root.as_str() {
+            "product-config" => clone_config.join(&file.relative_path),
+            "workspace" => clone_workspace.join(&file.relative_path),
+            _ => continue,
+        };
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+            if let Some(name) = parent.file_name().and_then(|name| name.to_str()) {
+                expected.insert(name.to_owned());
+            }
+        }
+        fs::write(destination, fs::read(&file.target_path)?)?;
+    }
+    let arguments = ["skills", "list", "--all"];
+    let execution = run_fixed_vendor_command(
+        executable,
+        &arguments,
+        &[
+            ("HOME", clone_home.as_path()),
+            ("USERPROFILE", clone_home.as_path()),
+            ("QODER_CONFIG_DIR", clone_config.as_path()),
+        ],
+        &clone_workspace,
+        scratch.path(),
+        Duration::from_secs(20),
+    )?;
+    let (status, discovered, diagnostic) = match execution {
+        FixedCommandResult::Completed {
+            success: true,
+            output,
+        } => {
+            let discovered = parse_qoder_skill_names(&output, scratch.path(), &expected);
+            if discovered == expected.len() {
+                (
+                    AssetProbeStatus::Verified,
+                    discovered,
+                    "all_assets_discovered",
+                )
+            } else {
+                (
+                    AssetProbeStatus::Failed,
+                    discovered,
+                    "expected_asset_not_discovered",
+                )
+            }
+        }
+        FixedCommandResult::Completed { success: false, .. } => {
+            (AssetProbeStatus::Failed, 0, "vendor_list_command_failed")
+        }
+        FixedCommandResult::TimedOut => {
+            (AssetProbeStatus::Failed, 0, "vendor_list_command_timed_out")
+        }
+        FixedCommandResult::OutputLimitExceeded => {
+            (AssetProbeStatus::Failed, 0, "vendor_output_limit_exceeded")
+        }
+    };
+    Ok(asset_probe_result(
+        tuple.clone(),
+        AssetKind::Skill,
+        status,
+        AssetProbeMethod::VendorListCommand,
+        arguments.iter().map(ToString::to_string).collect(),
+        diagnostic,
+        expected.len(),
+        discovered,
+        true,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn asset_probe_result(
+    tuple: ProductTuple,
+    asset_kind: AssetKind,
+    status: AssetProbeStatus,
+    method: AssetProbeMethod,
+    arguments: Vec<String>,
+    diagnostic: &str,
+    expected_assets: usize,
+    discovered_assets: usize,
+    isolated_copy: bool,
+) -> AssetProbe {
+    AssetProbe {
+        tuple,
+        asset_kind,
+        status,
+        method,
+        arguments,
+        diagnostic: diagnostic.to_owned(),
+        expected_assets,
+        discovered_assets,
+        isolated_copy,
+        migrated_components_started: false,
+    }
+}
+
+#[derive(Debug)]
+enum FixedCommandResult {
+    Completed { success: bool, output: Vec<u8> },
+    TimedOut,
+    OutputLimitExceeded,
+}
+
+const VENDOR_OUTPUT_LIMIT: u64 = 64 * 1024;
+
+fn run_fixed_vendor_command(
+    executable: &Path,
+    arguments: &[&str],
+    product_environment: &[(&str, &Path)],
+    working_directory: &Path,
+    scratch: &Path,
+    timeout: Duration,
+) -> Result<FixedCommandResult, CoreError> {
+    let stdout_path = scratch.join("vendor-stdout");
+    let stderr_path = scratch.join("vendor-stderr");
+    let stdout = File::create(&stdout_path)?;
+    let stderr = File::create(&stderr_path)?;
+    let mut command = Command::new(executable);
+    command
+        .args(arguments)
+        .current_dir(working_directory)
+        .env_clear()
+        .env("XDG_CONFIG_HOME", scratch.join("xdg-config"))
+        .env("XDG_CACHE_HOME", scratch.join("xdg-cache"))
+        .env("XDG_DATA_HOME", scratch.join("xdg-data"))
+        .env("APPDATA", scratch.join("appdata"))
+        .env("LOCALAPPDATA", scratch.join("local-appdata"))
+        .env("TMP", scratch)
+        .env("TEMP", scratch)
+        .env("TMPDIR", scratch)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    for (name, path) in product_environment {
+        command.env(name, path);
+    }
+    for name in ["PATH", "SYSTEMROOT", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if vendor_output_size(&stdout_path, &stderr_path)? > VENDOR_OUTPUT_LIMIT {
+            child.kill()?;
+            let _ = child.wait();
+            return Ok(FixedCommandResult::OutputLimitExceeded);
+        }
+        match child.try_wait()? {
+            Some(status) => {
+                if vendor_output_size(&stdout_path, &stderr_path)? > VENDOR_OUTPUT_LIMIT {
+                    return Ok(FixedCommandResult::OutputLimitExceeded);
+                }
+                let output = read_bounded_output(&stdout_path, VENDOR_OUTPUT_LIMIT)?;
+                return Ok(FixedCommandResult::Completed {
+                    success: status.success(),
+                    output,
+                });
+            }
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            None => {
+                child.kill()?;
+                let _ = child.wait();
+                return Ok(FixedCommandResult::TimedOut);
+            }
+        }
+    }
+}
+
+fn vendor_output_size(stdout: &Path, stderr: &Path) -> std::io::Result<u64> {
+    Ok(fs::metadata(stdout)?
+        .len()
+        .saturating_add(fs::metadata(stderr)?.len()))
+}
+
+fn read_bounded_output(stdout: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    File::open(stdout)?.take(limit).read_to_end(&mut output)?;
+    Ok(output)
+}
+
+fn parse_codex_mcp_names(output: &[u8]) -> Option<BTreeSet<String>> {
+    serde_json::from_slice::<Value>(output)
+        .ok()?
+        .as_array()?
+        .iter()
+        .map(|item| item.get("name")?.as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
+fn parse_qoder_skill_names(output: &[u8], scratch: &Path, expected: &BTreeSet<String>) -> usize {
+    let text = String::from_utf8_lossy(output);
+    let lines = text.lines().collect::<Vec<_>>();
+    expected
+        .iter()
+        .filter(|name| {
+            lines.iter().enumerate().any(|(index, line)| {
+                line.trim_start()
+                    .strip_prefix(name.as_str())
+                    .is_some_and(|suffix| suffix.starts_with(" ["))
+                    && lines.iter().skip(index + 1).take(5).any(|detail| {
+                        detail
+                            .trim_start()
+                            .strip_prefix("Location:")
+                            .is_some_and(|path| Path::new(path.trim()).starts_with(scratch))
+                    })
+            })
+        })
+        .count()
 }
 
 /// Inventory one platform without extracting asset bodies.
@@ -815,10 +1309,16 @@ fn is_sha256_id(value: &str) -> bool {
 /// Run read-only diagnostics.
 pub fn doctor() -> Result<DoctorReport, CoreError> {
     let state_paths = resolve_state_paths();
-    let recovery_candidates = state_paths.as_ref().map_or_else(
-        || Ok(Vec::new()),
-        |paths| scan_recovery_candidates(&paths.transactions),
-    )?;
+    let recovery_candidates = if let Some(paths) = state_paths.as_ref() {
+        let ledger_path = paths.data.join("ledger.sqlite");
+        let ledger = ledger_path
+            .exists()
+            .then(|| Ledger::open_read_only(&ledger_path))
+            .transpose()?;
+        scan_recovery_candidates_with_ledger(&paths.transactions, ledger.as_ref())?
+    } else {
+        Vec::new()
+    };
     Ok(DoctorReport {
         version: env!("CARGO_PKG_VERSION"),
         os: std::env::consts::OS,
@@ -875,6 +1375,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use mnemo_adapter_common::{CollectionMode, TargetRoot};
     use mnemo_schema::{Entrypoint, EvidenceLevel, PlanOperationKind, Platform, ProductTuple};
+    use std::collections::BTreeSet;
 
     #[test]
     fn registry_has_all_four_platforms() {
@@ -950,6 +1451,72 @@ mod tests {
             super::ConflictPolicy::SideBySide,
         );
         assert_eq!(sibling.locator, "rules.mnemo-12345678.md");
+    }
+
+    #[test]
+    fn managed_target_is_eligible_for_an_update() {
+        let observation = super::TargetObservation {
+            locator: "rules.md".to_owned(),
+            current_hash: Some("sha256:managed".to_owned()),
+            managed_hash: Some("sha256:managed".to_owned()),
+        };
+        let decision = super::resolve_file_conflict(
+            "sha256:new",
+            &observation,
+            super::ConflictPolicy::Preserve,
+        );
+        assert_eq!(decision.kind, PlanOperationKind::WriteFile);
+        assert_eq!(decision.reason, "managed_update");
+    }
+
+    #[test]
+    fn codex_mcp_parser_is_structured_and_rejects_text_fallback() {
+        let parsed = super::parse_codex_mcp_names(
+            br#"[{"name":"first","enabled":false},{"name":"second"}]"#,
+        )
+        .unwrap_or_default();
+        assert_eq!(
+            parsed,
+            BTreeSet::from(["first".to_owned(), "second".to_owned()])
+        );
+        assert!(super::parse_codex_mcp_names(b"first enabled").is_none());
+        assert!(super::parse_codex_mcp_names(br#"[{"enabled":true}]"#).is_none());
+    }
+
+    #[test]
+    fn qoder_skill_parser_requires_a_vendor_location_inside_the_clone() {
+        let scratch = std::path::Path::new("/tmp/mnemoport-fixture");
+        let expected = BTreeSet::from(["review".to_owned()]);
+        let accepted = b"review [Enabled]\n  Description: review\n  Location: /tmp/mnemoport-fixture/qoder-config/skills/review/SKILL.md\n";
+        assert_eq!(
+            super::parse_qoder_skill_names(accepted, scratch, &expected),
+            1
+        );
+        let directory_only = b"review [Enabled]\n  Description: review\n  Location: /home/user/.qoder/skills/review/SKILL.md\n";
+        assert_eq!(
+            super::parse_qoder_skill_names(directory_only, scratch, &expected),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixed_vendor_command_stops_when_output_exceeds_the_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scratch = tempfile::tempdir()?;
+        let result = super::run_fixed_vendor_command(
+            std::path::Path::new("/bin/sh"),
+            &["-c", "printf '%070000d' 0"],
+            &[],
+            scratch.path(),
+            scratch.path(),
+            std::time::Duration::from_secs(2),
+        )?;
+        assert!(matches!(
+            result,
+            super::FixedCommandResult::OutputLimitExceeded
+        ));
+        Ok(())
     }
 
     #[test]

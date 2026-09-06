@@ -154,6 +154,57 @@ pub struct ProductProbe {
     pub migrated_components_started: bool,
 }
 
+/// Outcome of one asset-kind discovery recipe on an exact product tuple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetProbeStatus {
+    /// The vendor-owned discovery surface reported every expected asset.
+    Verified,
+    /// No safe authoritative discovery surface is admitted for this tuple.
+    Manual,
+    /// A recipe exists for another exact version, OS, or entrypoint only.
+    UnsupportedVersion,
+    /// The required vendor executable is not installed.
+    Unavailable,
+    /// The bounded command or its parser failed safely.
+    Failed,
+}
+
+/// Mechanism used to obtain asset-level discovery evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetProbeMethod {
+    /// No command was run; the result is an explicit safe downgrade.
+    None,
+    /// A fixed vendor-owned read-only list command was executed directly.
+    VendorListCommand,
+}
+
+/// Asset-level L1 evidence for one exact product and asset kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetProbe {
+    /// Exact product tuple, including the probed version when available.
+    pub tuple: ProductTuple,
+    /// Canonical asset category checked by this recipe.
+    pub asset_kind: AssetKind,
+    /// Discovery outcome.
+    pub status: AssetProbeStatus,
+    /// Discovery mechanism.
+    pub method: AssetProbeMethod,
+    /// Fixed adapter-owned arguments; migrated content cannot add arguments.
+    pub arguments: Vec<String>,
+    /// Stable log-safe result code.
+    pub diagnostic: String,
+    /// Number of migrated identifiers that should be discovered.
+    pub expected_assets: usize,
+    /// Number of expected identifiers reported by the vendor parser.
+    pub discovered_assets: usize,
+    /// Whether the recipe used a disposable configuration clone.
+    pub isolated_copy: bool,
+    /// Always false for L1 recipes.
+    pub migrated_components_started: bool,
+}
+
 /// Canonical asset kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

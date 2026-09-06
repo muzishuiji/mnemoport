@@ -5,10 +5,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use mnemo_adapter_common::CollectionMode;
 use mnemo_schema::{
-    CommandResponse, Diagnostic, MigrationPlan, PlanOperationKind, Platform, ProbeStatus,
+    AssetProbe, AssetProbeStatus, CommandResponse, Diagnostic, MigrationPlan, PlanOperationKind,
+    Platform, ProbeStatus,
 };
-use mnemo_store::{Ledger, ManagedObjectRecord, OperationStatus, TransactionStatus};
+use mnemo_store::{Ledger, OperationStatus};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -129,6 +131,9 @@ enum Command {
         /// Immutable target plan used by apply.
         #[arg(long)]
         plan: PathBuf,
+        /// Verification depth. L1 runs only exact, admitted vendor discovery recipes.
+        #[arg(long, value_enum, default_value_t = VerifyLevel::L0)]
+        level: VerifyLevel,
         /// Emit the stable JSON response envelope.
         #[arg(long)]
         json: bool,
@@ -270,6 +275,12 @@ enum IntegrationScope {
     Project,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum VerifyLevel {
+    L0,
+    L1,
+}
+
 #[derive(Debug, Serialize)]
 struct ExportReport {
     output: PathBuf,
@@ -324,6 +335,7 @@ struct VerifyReport {
     files_verified: usize,
     skipped_assets: usize,
     level: &'static str,
+    asset_discovery: Vec<AssetProbe>,
 }
 
 #[derive(Debug, Serialize)]
@@ -488,7 +500,7 @@ fn run(cli: Cli) -> Result<u8> {
             let assets = mnemo_core::unpack_assets(&verified)?;
             let workspace = std::env::current_dir()?;
             let (target, roots) = mnemo_core::resolve_target_roots(to, &workspace)?;
-            let prepared = mnemo_core::prepare_migration(target, &roots, &assets)?;
+            let prepared = prepare_with_ownership(target, &roots, &assets)?;
             if !prepared.skipped.is_empty()
                 || prepared
                     .plan
@@ -533,7 +545,7 @@ fn run(cli: Cli) -> Result<u8> {
             let workspace = std::env::current_dir()?;
             let (target, roots) =
                 mnemo_core::resolve_target_roots(saved.target.platform, &workspace)?;
-            let prepared = mnemo_core::prepare_migration(target, &roots, &assets)?;
+            let prepared = prepare_with_ownership(target, &roots, &assets)?;
             if prepared.plan != saved {
                 anyhow::bail!(
                     "target or package drifted after planning; discard the plan and run mnemo plan again"
@@ -545,9 +557,19 @@ fn run(cli: Cli) -> Result<u8> {
             }
             emit(json, "apply", report)?;
         }
-        Command::Verify { input, plan, json } => {
-            let report = verify_migration(&input, &plan)?;
-            if report.skipped_assets > 0 {
+        Command::Verify {
+            input,
+            plan,
+            level,
+            json,
+        } => {
+            let report = verify_migration(&input, &plan, level)?;
+            if report.skipped_assets > 0
+                || report
+                    .asset_discovery
+                    .iter()
+                    .any(|item| item.status != AssetProbeStatus::Verified)
+            {
                 outcome = 2;
             }
             emit(json, "verify", report)?;
@@ -563,11 +585,7 @@ fn run(cli: Cli) -> Result<u8> {
             RecoveryAction::List { json } => {
                 let state =
                     mnemo_store::resolve_state_paths().context("state paths unavailable")?;
-                emit(
-                    json,
-                    "recovery-list",
-                    mnemo_store::scan_recovery_candidates(&state.transactions)?,
-                )?;
+                emit(json, "recovery-list", recovery_candidates(&state)?)?;
             }
             RecoveryAction::Rollback {
                 transaction_id,
@@ -578,10 +596,7 @@ fn run(cli: Cli) -> Result<u8> {
                 emit(
                     json,
                     "recovery-rollback",
-                    mnemo_store::rollback_prepared_transaction(
-                        &state.transactions,
-                        &transaction_id,
-                    )?,
+                    rollback_recovery_candidate(&state, &transaction_id)?,
                 )?;
             }
         },
@@ -684,7 +699,7 @@ fn command_phase(command: &Command) -> &'static str {
     }
 }
 
-fn verify_migration(input: &Path, plan: &Path) -> Result<VerifyReport> {
+fn verify_migration(input: &Path, plan: &Path, level: VerifyLevel) -> Result<VerifyReport> {
     let saved: MigrationPlan = serde_json::from_slice(
         &fs::read(plan).with_context(|| format!("cannot read {}", plan.display()))?,
     )
@@ -699,7 +714,7 @@ fn verify_migration(input: &Path, plan: &Path) -> Result<VerifyReport> {
     let assets = mnemo_core::unpack_assets(&verified)?;
     let workspace = std::env::current_dir()?;
     let (target, roots) = mnemo_core::resolve_target_roots(saved.target.platform, &workspace)?;
-    let prepared = mnemo_core::prepare_migration(target, &roots, &assets)?;
+    let prepared = prepare_with_ownership(target.clone(), &roots, &assets)?;
     if prepared.plan.source_root_hash != saved.source_root_hash
         || prepared.plan.target != saved.target
         || prepared.plan.adapter_version != saved.adapter_version
@@ -721,6 +736,11 @@ fn verify_migration(input: &Path, plan: &Path) -> Result<VerifyReport> {
     } else {
         false
     };
+    let asset_discovery = if level == VerifyLevel::L1 {
+        mnemo_core::verify_asset_discovery(&target, &roots, &assets, &prepared)?
+    } else {
+        Vec::new()
+    };
     Ok(VerifyReport {
         package_id: verified.manifest.package_id,
         plan_id: saved.plan_id,
@@ -728,8 +748,73 @@ fn verify_migration(input: &Path, plan: &Path) -> Result<VerifyReport> {
         signer_trusted,
         files_verified: prepared.files.len(),
         skipped_assets: prepared.skipped.len(),
-        level: "l0",
+        level: match level {
+            VerifyLevel::L0 => "l0",
+            VerifyLevel::L1 => "l1",
+        },
+        asset_discovery,
     })
+}
+
+fn prepare_with_ownership(
+    target: mnemo_schema::ProductTuple,
+    roots: &mnemo_core::TargetRoots,
+    assets: &[mnemo_adapter_common::ExtractedAsset],
+) -> Result<mnemo_core::PreparedMigration> {
+    let preliminary = mnemo_core::prepare_migration(target.clone(), roots, assets)?;
+    let state = mnemo_store::resolve_state_paths().context("state paths unavailable")?;
+    let ledger_path = state.data.join("ledger.sqlite");
+    if !ledger_path.exists() {
+        return Ok(preliminary);
+    }
+    let ledger = Ledger::open_read_only(&ledger_path)?;
+    let mut managed_hashes = BTreeMap::new();
+    for file in &preliminary.files {
+        let locator = file.target_path.to_string_lossy().into_owned();
+        if let Some(record) = ledger.managed_object(&locator)? {
+            managed_hashes.insert(locator, record.installed_hash);
+        }
+    }
+    if managed_hashes.is_empty() {
+        Ok(preliminary)
+    } else {
+        Ok(mnemo_core::prepare_migration_with_managed(
+            target,
+            roots,
+            assets,
+            &managed_hashes,
+        )?)
+    }
+}
+
+fn recovery_candidates(
+    state: &mnemo_store::StatePaths,
+) -> Result<Vec<mnemo_store::RecoveryCandidate>> {
+    let ledger_path = state.data.join("ledger.sqlite");
+    let ledger = ledger_path
+        .exists()
+        .then(|| Ledger::open_read_only(&ledger_path))
+        .transpose()?;
+    Ok(mnemo_store::scan_recovery_candidates_with_ledger(
+        &state.transactions,
+        ledger.as_ref(),
+    )?)
+}
+
+fn rollback_recovery_candidate(
+    state: &mnemo_store::StatePaths,
+    transaction_id: &str,
+) -> Result<mnemo_store::FileTransactionJournal> {
+    let ledger_path = state.data.join("ledger.sqlite");
+    let ledger = ledger_path
+        .exists()
+        .then(|| Ledger::open_read_only(&ledger_path))
+        .transpose()?;
+    Ok(mnemo_store::rollback_recoverable_transaction(
+        &state.transactions,
+        transaction_id,
+        ledger.as_ref(),
+    )?)
 }
 
 fn operation_report(operation_id: &str) -> Result<OperationReport> {
@@ -849,18 +934,19 @@ fn install_integration(host: Platform, scope: IntegrationScope) -> Result<Integr
         "integration-install",
         &serde_json::json!({"host": host, "path": path}),
     )?;
-    let journal = mnemo_store::apply_file(&path, content, &state.transactions, None)?;
-    ledger.record_transaction(&operation_id, &journal)?;
-    ledger.record_managed_object(&ManagedObjectRecord {
-        target_locator: path.to_string_lossy().into_owned(),
-        owner_id: operation_id.clone(),
-        installed_hash: expected_hash.clone(),
-        source_asset_id: format!(
-            "integration:{}:{}",
-            host.as_str(),
-            env!("CARGO_PKG_VERSION")
-        ),
-    })?;
+    let mut journal = mnemo_store::apply_file(&path, content, &state.transactions, None)?;
+    let source_asset_id = format!(
+        "integration:{}:{}",
+        host.as_str(),
+        env!("CARGO_PKG_VERSION")
+    );
+    if let Err(error) =
+        ledger.record_transaction_with_managed_object(&operation_id, &journal, &source_asset_id)
+    {
+        let _ = mnemo_store::undo_file(&mut journal, false);
+        let _ = ledger.finish_operation(&operation_id, OperationStatus::RolledBack);
+        return Err(error).context("integration ownership record failed; file rollback attempted");
+    }
     ledger.finish_operation(&operation_id, OperationStatus::Succeeded)?;
     Ok(IntegrationReport {
         host,
@@ -1022,9 +1108,10 @@ fn apply_prepared(prepared: &mnemo_core::PreparedMigration) -> Result<ApplyRepor
                 ) {
                     Ok(journal) => {
                         committed.push(journal);
-                        if let Err(error) = ledger.record_transaction(
+                        if let Err(error) = ledger.record_transaction_with_managed_object(
                             &migration_id,
                             committed.last().context("committed journal disappeared")?,
+                            &file.asset_id,
                         ) {
                             let rollback_ok = rollback_all(&ledger, &mut committed);
                             let _ = ledger.finish_operation(
@@ -1076,11 +1163,17 @@ fn rollback_all(ledger: &Ledger, journals: &mut [mnemo_store::FileTransactionJou
     let mut success = true;
     for journal in journals.iter_mut().rev() {
         if mnemo_store::undo_file(journal, false).is_ok() {
-            if ledger
-                .set_transaction_status(&journal.id, TransactionStatus::RolledBack)
-                .is_err()
-            {
-                success = false;
+            match ledger.has_transaction(&journal.id) {
+                Ok(true) => {
+                    if ledger
+                        .rollback_transaction_and_managed_object(&journal.id)
+                        .is_err()
+                    {
+                        success = false;
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => success = false,
             }
         } else {
             success = false;
@@ -1102,7 +1195,7 @@ fn undo_migration(migration_id: &str) -> Result<UndoReport> {
         let mut journal = mnemo_store::load_journal(&path)?;
         mnemo_store::undo_file(&mut journal, false)
             .with_context(|| format!("undo stopped safely at {}", journal.target.display()))?;
-        ledger.set_transaction_status(&journal.id, TransactionStatus::RolledBack)?;
+        ledger.rollback_transaction_and_managed_object(&journal.id)?;
         restored += 1;
     }
     ledger.finish_operation(migration_id, OperationStatus::RolledBack)?;

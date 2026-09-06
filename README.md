@@ -9,7 +9,7 @@ Tool X on device A  ->  encrypted .mnemo package  ->  Tool X on device B
 Tool X              ->  canonical asset model    ->  Tool Y
 ```
 
-MnemoPort is a source-installable alpha. Its Rust CLI, signed and encrypted package format, transactional apply/undo, four offline adapters, four thin host Skills, and all 16 Core source→target smoke directions are implemented and tested. Native auto-memory stores, account/cloud data, plugin network installation, and broad preference migration remain deliberately non-automatic.
+MnemoPort is an alpha available as prerelease binaries or from source. Its Rust CLI, signed and encrypted package format, transactional apply/undo, four offline adapters, four thin host Skills, and all 16 Core source→target smoke directions are implemented and tested. Native auto-memory stores, account/cloud data, plugin network installation, and broad preference migration remain deliberately non-automatic.
 
 MnemoPort is model-provider independent. It does not call an LLM API and never needs an OpenAI, Anthropic, DeepSeek, or other model-provider API key. It runs locally under the AI coding tool the user already authenticated. `MNEMOPORT_PASSPHRASE` is only a user-chosen encryption passphrase for a `.mnemo` package; it is not a model credential.
 
@@ -37,7 +37,23 @@ Support is capability-aware, not an assertion that every asset can be losslessly
 - Git for cloning and updating the source checkout.
 - No model-provider API key.
 
-## Install the CLI
+## Install a release binary
+
+Download the archive and adjacent `.sha256` file for your platform from [GitHub Releases](https://github.com/muzishuiji/mnemoport/releases). For Linux x86-64:
+
+```bash
+version=v0.1.0-alpha.1
+curl -LO "https://github.com/muzishuiji/mnemoport/releases/download/$version/mnemoport-x86_64-unknown-linux-gnu.tar.gz"
+curl -LO "https://github.com/muzishuiji/mnemoport/releases/download/$version/mnemoport-x86_64-unknown-linux-gnu.tar.gz.sha256"
+sha256sum --check mnemoport-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf mnemoport-x86_64-unknown-linux-gnu.tar.gz
+install -m 0755 mnemo "$HOME/.local/bin/mnemo"
+mnemo --version
+```
+
+The other archives are `mnemoport-aarch64-apple-darwin.tar.gz` for Apple Silicon macOS and `mnemoport-x86_64-pc-windows-msvc.zip` for Windows x86-64. Verify the checksum before extracting, then place `mnemo` or `mnemo.exe` in a directory on `PATH`. See [release security](docs/release-security.md) to verify GitHub provenance.
+
+## Install the CLI from source
 
 Clone the repository and install the `mnemo` binary with Cargo:
 
@@ -132,6 +148,14 @@ mnemo apply --input claude-assets.mnemo --plan migration-plan.json --approve <ap
 mnemo verify --input claude-assets.mnemo --plan migration-plan.json --json
 ```
 
+The default verification level is L0. After L0 passes, request version-gated native discovery where an exact safe recipe exists:
+
+```bash
+mnemo verify --input claude-assets.mnemo --plan migration-plan.json --level l1 --json
+```
+
+L1 reports one structured result per migrated asset kind. The current release can automatically discover Codex CLI `0.144.1` MCP entries and Qoder CLI `1.1.42` Skills on Linux; other tuples and asset kinds return an explicit `manual`, `unsupported_version`, or `unavailable` status and exit code `2`.
+
 Do not reuse a stale plan. If target files change after planning, create a new output filename and run `plan` again.
 
 ### Cross-device or same-tool migration (X→X)
@@ -184,7 +208,7 @@ Undo restores the pre-migration bytes only when the files still match the state 
 
 ### Interrupted-process recovery
 
-Every file replacement writes and syncs its rollback backup and `prepared` journal before replacing the target. `mnemo doctor --json` reports any prepared transactions left by a process or machine interruption. Inspect them without writing:
+Every file replacement writes and syncs its rollback backup and `prepared` journal before replacing the target. `mnemo doctor --json` also detects a `committed` journal whose ledger acknowledgement was interrupted. Inspect either kind without writing:
 
 ```bash
 mnemo recovery list --json
@@ -196,7 +220,7 @@ Each candidate is classified from exact before/current/after hashes as `mark-rol
 mnemo recovery rollback <transaction-id> --json
 ```
 
-Recovery verifies the journal location and rollback backup hash. It refuses `manual-review` when the target matches neither recorded state, so an external edit is never guessed away.
+Recovery verifies the journal location and rollback backup hash. It refuses `manual-review` when the target matches neither recorded state, so an external edit is never guessed away. Ledger transaction and managed-file ownership updates commit atomically; undo restores the previous owner for a managed update or removes ownership created by the undone migration.
 
 ### Explicit product probe
 
@@ -209,7 +233,7 @@ mnemo probe --platform cursor --json
 
 The probe invokes only the adapter-owned `--version` argument, without a shell or asset-derived input. It clears credential-bearing environment variables, supplies a disposable home, captures at most 8 KiB, terminates the child after five seconds, deletes the disposable directory, and never initializes migrated Skills, MCP servers, or plugins. Results are entrypoint-specific; missing CLI, unsupported Desktop/GUI entrypoints, failures, and timeouts produce explicit statuses and exit code `2`.
 
-This is version-level L1 evidence, not proof that a particular migrated asset was discovered. The child process is not placed in an OS network namespace, so run it only for an installed executable you trust. See [Product probes](docs/product-probes.md) for the exact boundary.
+This is version-level L1 evidence, not proof that a particular migrated asset was discovered. Asset-level L1 is requested separately with `mnemo verify --level l1`; every automatic recipe uses fixed arguments, a disposable private copy of only the required target state, a timeout, bounded output, and a structured parser. It never starts migrated MCP servers, Skills, plugins, or hooks. The child process is not placed in an OS network namespace, so run probes only for an installed executable you trust. See [Product probes](docs/product-probes.md) for the exact boundary and compatibility matrix.
 
 ### New-session Handoff capsule
 
@@ -236,7 +260,7 @@ On the target, use the normal `inspect` → `plan` → `trust` → `apply` flow.
 | `mnemo trust add --input FILE` | MnemoPort state only | Trust the verified signing identity of one source device |
 | `mnemo trust list` | No | List locally trusted signer fingerprints |
 | `mnemo apply --input FILE --plan PLAN --approve TOKEN` | Yes | Revalidate and transactionally write approved target files |
-| `mnemo verify --input FILE --plan PLAN` | No | Rebuild expected L0 bytes and compare target hashes |
+| `mnemo verify --input FILE --plan PLAN [--level l0\|l1]` | Disposable L1 probe state only | Compare target hashes; optionally request exact-tuple native asset discovery |
 | `mnemo report ID` | No | Read operation status and journal count |
 | `mnemo undo MIGRATION_ID` | Yes | Restore unchanged targets from local backups |
 | `mnemo recovery list` | No | Classify prepared journals left by an interruption |
@@ -278,13 +302,13 @@ Overrides select roots; they do not expand the asset allowlist. Run `mnemo docto
 - Source inventory and extraction are read-only and never launch the source product.
 - `.mnemo` content is deterministic, zstd-compressed, Ed25519-signed, and age-encrypted by default.
 - Paths, symlinks, archive sizes, signatures, hashes, object closure, and target preconditions are verified.
-- Apply uses synced local backups, durable journals, a SQLite audit ledger, and strong rollback for local files.
+- Apply uses synced local backups, durable journals, and an atomic SQLite transaction/ownership update, with strong rollback for local files.
 - Existing unrelated target content is preserved; conflicts are never silently overwritten.
 - Authentication values, cookies, keychains, internal databases, trust decisions, and caches do not migrate.
 - Scripts, hooks, plugins, and MCP servers are not executed during inventory, inspect, plan, or the default L0 verification.
 - `--allow-plaintext` is an explicit escape hatch for intentional non-sensitive fixtures. It should not be used for real personal assets.
 
-The alpha does not yet perform network plugin/extension installation, CLI dependency installation, OAuth/account export, MCP server execution, native auto-memory import, or broad editor-profile synchronization. It records or inventories these surfaces only when the adapter can do so safely. Prepared-journal crash recovery and version-level L1 probes are implemented; asset-level native discovery, later ledger crash points, and a first public binary tag remain release gates. The repository contains SBOM/provenance automation, but those claims apply to artifacts only after their tagged workflow succeeds.
+The alpha does not perform network plugin/extension installation, CLI dependency installation, OAuth/account export, MCP server execution, native auto-memory import, or broad editor-profile synchronization. It records or inventories these surfaces only when the adapter can do so safely. Prepared and committed-but-unacknowledged crash recovery, atomic managed ownership, version-level probes, and the two exact-tuple asset-level L1 recipes documented above are implemented. Native claims outside that narrow matrix remain manual. Release artifact and provenance claims apply only after the tagged workflow succeeds.
 
 ## Troubleshooting
 

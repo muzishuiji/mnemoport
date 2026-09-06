@@ -7,8 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-mnemo-adapter-common = { version = "0.1.0", path = "../common" }
-mnemo-schema = { version = "0.1.0", path = "../../mnemo-schema" }
+mnemo-adapter-common = { version = "0.1.0-alpha.1", path = "../common" }
+mnemo-schema = { version = "0.1.0-alpha.1", path = "../../mnemo-schema" }
 
 [dev-dependencies]
 tempfile.workspace = true

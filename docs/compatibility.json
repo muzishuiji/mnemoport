@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "release": "0.1.0-alpha",
+  "release": "0.1.0-alpha.1",
   "generated_on": "2026-09-06",
   "evidence_policy": "Claims do not transfer across version, OS, entrypoint, asset, or direction.",
   "fixture_contract": {
@@ -19,11 +19,51 @@
     "tuples": [
       { "platform": "claude-code", "entrypoint": "cli", "version": "2.1.259", "status": "verified" },
       { "platform": "codex", "entrypoint": "cli", "version": "0.144.1", "status": "verified" },
-      { "platform": "qoder", "entrypoint": "cli", "version": null, "status": "unavailable" },
+      { "platform": "qoder", "entrypoint": "cli", "version": "1.1.42", "status": "verified" },
       { "platform": "qoder", "entrypoint": "desktop-app", "version": null, "status": "unsupported_entrypoint" },
       { "platform": "cursor", "entrypoint": "agent", "version": "2026.09.02-c22c1a3", "status": "verified" },
       { "platform": "cursor", "entrypoint": "ide-editor", "version": "3.17.21", "status": "verified" }
     ]
+  },
+  "native_asset_probe_observation": {
+    "observed_on": "2026-09-06",
+    "os": "linux",
+    "level": "l1-asset-discovery",
+    "boundary": "Only exact tuple and asset-kind recipes are automatic; no migrated component was started.",
+    "results": [
+      {
+        "platform": "codex",
+        "entrypoint": "cli",
+        "version": "0.144.1",
+        "asset_kind": "mcp",
+        "status": "verified",
+        "method": "vendor_list_command",
+        "arguments": ["mcp", "list", "--json"],
+        "expected_assets": 1,
+        "discovered_assets": 1,
+        "isolated_copy": true,
+        "migrated_components_started": false
+      },
+      {
+        "platform": "qoder",
+        "entrypoint": "cli",
+        "version": "1.1.42",
+        "asset_kind": "skill",
+        "status": "verified",
+        "method": "vendor_list_command",
+        "arguments": ["skills", "list", "--all"],
+        "expected_assets": 1,
+        "discovered_assets": 1,
+        "isolated_copy": true,
+        "migrated_components_started": false
+      }
+    ],
+    "manual_cells": {
+      "claude-code": ["instruction", "skill", "mcp"],
+      "codex": ["instruction", "skill"],
+      "qoder": ["instruction", "mcp"],
+      "cursor": ["instruction", "skill", "mcp"]
+    }
   },
   "directions": [
     { "source": "claude-code", "target": "claude-code", "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
