@@ -1,5 +1,7 @@
 # MnemoPort
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 MnemoPort is an open-source portability layer for personal AI assets. It moves file-backed instructions, Skills, prompts, and credential-free MCP definitions between Codex, Claude Code, Qoder, and Cursor—or between two devices running the same tool.
 
 ```text
