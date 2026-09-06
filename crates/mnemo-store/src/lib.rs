@@ -770,14 +770,15 @@ mod tests {
     #[test]
     fn apply_and_undo_restore_original_bytes() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
-        let target = temp.path().join("config/settings.json");
+        let root = temp.path().canonicalize()?;
+        let target = root.join("config/settings.json");
         std::fs::create_dir_all(target.parent().ok_or("target parent absent")?)?;
         std::fs::write(&target, b"before")?;
         let expected = mnemo_security::sha256_id(b"before");
         let mut journal = apply_file(
             &target,
             b"after",
-            &temp.path().join("transactions"),
+            &root.join("transactions"),
             Some(&expected),
         )?;
         assert_eq!(std::fs::read(&target)?, b"after");
@@ -796,12 +797,13 @@ mod tests {
     #[test]
     fn rejects_stale_plan_and_modified_target_on_undo() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
-        let target = temp.path().join("settings.json");
+        let root = temp.path().canonicalize()?;
+        let target = root.join("settings.json");
         std::fs::write(&target, b"current")?;
         let result = apply_file(
             &target,
             b"new",
-            &temp.path().join("transactions"),
+            &root.join("transactions"),
             Some(&mnemo_security::sha256_id(b"stale")),
         );
         assert!(matches!(result, Err(StoreError::Precondition { .. })));
@@ -809,7 +811,7 @@ mod tests {
         let mut journal = apply_file(
             &target,
             b"new",
-            &temp.path().join("transactions"),
+            &root.join("transactions"),
             Some(&mnemo_security::sha256_id(b"current")),
         )?;
         std::fs::write(&target, b"external edit")?;
@@ -827,12 +829,13 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir()?;
-        let real = temp.path().join("real");
-        let link = temp.path().join("link");
+        let root = temp.path().canonicalize()?;
+        let real = root.join("real");
+        let link = root.join("link");
         std::fs::write(&real, b"protected")?;
         symlink(&real, &link)?;
         assert!(matches!(
-            apply_file(&link, b"changed", &temp.path().join("tx"), None),
+            apply_file(&link, b"changed", &root.join("tx"), None),
             Err(StoreError::UnsafePath(_))
         ));
         assert_eq!(std::fs::read(&real)?, b"protected");
@@ -845,14 +848,15 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir()?;
-        let outside = temp.path().join("outside");
-        let link = temp.path().join("approved/link");
+        let root = temp.path().canonicalize()?;
+        let outside = root.join("outside");
+        let link = root.join("approved/link");
         std::fs::create_dir_all(&outside)?;
         std::fs::create_dir_all(link.parent().ok_or("link parent missing")?)?;
         symlink(&outside, &link)?;
         let target = link.join("settings.json");
         assert!(matches!(
-            apply_file(&target, b"changed", &temp.path().join("tx"), None),
+            apply_file(&target, b"changed", &root.join("tx"), None),
             Err(StoreError::UnsafePath(_))
         ));
         assert!(!outside.join("settings.json").exists());
