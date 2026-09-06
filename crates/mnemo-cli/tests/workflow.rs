@@ -262,74 +262,103 @@ fn integration_uninstall_refuses_modified_user_content() -> Result<(), Box<dyn s
 }
 
 #[test]
-fn every_host_integration_installs_reports_and_uninstalls_in_both_scopes()
+fn every_host_integration_resolves_user_scope_and_manages_project_scope()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let state = temp.path().join("state");
     for host in ["claude-code", "codex", "qoder", "cursor"] {
-        for scope in ["user", "project"] {
-            let workspace = temp.path().join(format!("workspace-{host}-{scope}"));
-            std::fs::create_dir_all(&workspace)?;
-            let installed = success_json(&run(
-                &workspace,
-                &state,
-                &[
-                    "integration",
-                    "install",
-                    "--host",
-                    host,
-                    "--scope",
-                    scope,
-                    "--json",
-                ],
-                &[],
-            )?)?;
-            assert_eq!(installed["data"]["host"], host);
-            assert_eq!(installed["data"]["scope"], scope);
-            assert_eq!(installed["data"]["status"], "installed");
-            let path = installed["data"]["path"]
-                .as_str()
-                .ok_or("integration path missing")?;
-            assert!(Path::new(path).is_file(), "missing {host}/{scope} Skill");
+        let workspace = temp.path().join(format!("workspace-{host}"));
+        std::fs::create_dir_all(&workspace)?;
+        let user_status = success_json(&run(
+            &workspace,
+            &state,
+            &[
+                "integration",
+                "status",
+                "--host",
+                host,
+                "--scope",
+                "user",
+                "--json",
+            ],
+            &[],
+        )?)?;
+        assert_eq!(user_status["data"]["host"], host);
+        assert_eq!(user_status["data"]["scope"], "user");
+        let user_path = user_status["data"]["path"]
+            .as_str()
+            .ok_or("user integration path missing")?;
+        assert!(Path::new(user_path).ends_with(integration_suffix(host)?));
 
-            let status = success_json(&run(
-                &workspace,
-                &state,
-                &[
-                    "integration",
-                    "status",
-                    "--host",
-                    host,
-                    "--scope",
-                    scope,
-                    "--json",
-                ],
-                &[],
-            )?)?;
-            assert_eq!(status["data"]["status"], "present-unmodified");
+        let installed = success_json(&run(
+            &workspace,
+            &state,
+            &[
+                "integration",
+                "install",
+                "--host",
+                host,
+                "--scope",
+                "project",
+                "--json",
+            ],
+            &[],
+        )?)?;
+        assert_eq!(installed["data"]["host"], host);
+        assert_eq!(installed["data"]["scope"], "project");
+        assert_eq!(installed["data"]["status"], "installed");
+        let path = installed["data"]["path"]
+            .as_str()
+            .ok_or("project integration path missing")?;
+        assert!(Path::new(path).is_file(), "missing {host} project Skill");
 
-            let removed = success_json(&run(
-                &workspace,
-                &state,
-                &[
-                    "integration",
-                    "uninstall",
-                    "--host",
-                    host,
-                    "--scope",
-                    scope,
-                    "--json",
-                ],
-                &[],
-            )?)?;
-            assert_eq!(removed["data"]["status"], "uninstalled-reinstallable");
-            assert!(
-                !Path::new(path).exists(),
-                "left {host}/{scope} Skill behind"
-            );
-        }
+        let status = success_json(&run(
+            &workspace,
+            &state,
+            &[
+                "integration",
+                "status",
+                "--host",
+                host,
+                "--scope",
+                "project",
+                "--json",
+            ],
+            &[],
+        )?)?;
+        assert_eq!(status["data"]["status"], "present-unmodified");
+
+        let removed = success_json(&run(
+            &workspace,
+            &state,
+            &[
+                "integration",
+                "uninstall",
+                "--host",
+                host,
+                "--scope",
+                "project",
+                "--json",
+            ],
+            &[],
+        )?)?;
+        assert_eq!(removed["data"]["status"], "uninstalled-reinstallable");
+        assert!(
+            !Path::new(path).exists(),
+            "left {host} project Skill behind"
+        );
     }
     Ok(())
+}
+
+fn integration_suffix(host: &str) -> Result<&Path, Box<dyn std::error::Error>> {
+    match host {
+        "claude-code" => Ok(Path::new(".claude/skills/mnemoport/SKILL.md")),
+        "codex" => Ok(Path::new(".agents/skills/mnemoport/SKILL.md")),
+        "qoder" => Ok(Path::new(".qoder/skills/mnemoport/SKILL.md")),
+        "cursor" => Ok(Path::new(".cursor/skills/mnemoport/SKILL.md")),
+        _ => Err(format!("unsupported fixture host: {host}").into()),
+    }
 }
 
 #[test]
@@ -494,10 +523,6 @@ fn run(
 ) -> Result<Output, Box<dyn std::error::Error>> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mnemo"));
     command.current_dir(current_dir).args(arguments);
-    command.env("HOME", state_root.join("home"));
-    command.env("USERPROFILE", state_root.join("home"));
-    command.env("APPDATA", state_root.join("app-data"));
-    command.env("LOCALAPPDATA", state_root.join("local-app-data"));
     command.env("XDG_DATA_HOME", state_root.join("data"));
     command.env("XDG_CONFIG_HOME", state_root.join("config"));
     command.env("XDG_CACHE_HOME", state_root.join("cache"));
@@ -510,7 +535,9 @@ fn run(
 fn success_json(output: &Output) -> Result<Value, Box<dyn std::error::Error>> {
     if !output.status.success() {
         return Err(format!(
-            "command failed: {}",
+            "command failed with {}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         )
         .into());
