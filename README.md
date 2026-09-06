@@ -9,6 +9,8 @@ Tool X              ->  canonical asset model    ->  Tool Y
 
 The project is an implementation-stage alpha. The Rust CLI, signed/encrypted package, transactional apply/undo, four offline adapters, four thin host Skills, and the 16-direction Core smoke matrix are implemented and tested. Native auto-memory stores, account/cloud data, plugin network installation, and full preference allowlists remain deliberately non-automatic.
 
+MnemoPort is model-provider independent. It does not call an LLM API and never needs an OpenAI, Anthropic, DeepSeek, or other model-provider API key. It runs as a local CLI under the AI coding tool the user already authenticated. `MNEMOPORT_PASSPHRASE` is only a user-chosen encryption passphrase for a cross-device `.mnemo` package; it is not a model credential.
+
 ## What it migrates today
 
 | Asset | Current alpha behavior |

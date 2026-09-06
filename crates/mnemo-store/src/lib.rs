@@ -558,6 +558,7 @@ fn set_private_directory_permissions(path: &Path) -> Result<(), StoreError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_private_directory_permissions(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
@@ -570,6 +571,7 @@ fn set_private_file_permissions(file: &File) -> Result<(), StoreError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_private_file_permissions(_file: &File) -> Result<(), StoreError> {
     Ok(())
 }
@@ -632,6 +634,7 @@ fn sync_directory(path: &Path) -> Result<(), StoreError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn sync_directory(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }

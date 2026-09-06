@@ -932,8 +932,12 @@ mod tests {
     fn claude_assets_survive_package_and_render_for_codex() -> Result<(), Box<dyn std::error::Error>>
     {
         let temp = tempfile::tempdir()?;
-        let source_config = temp.path().join("claude-home");
-        let source_repo = temp.path().join("source-repo");
+        // macOS exposes its temporary directory through `/var`, which is a
+        // system symlink to `/private/var`. Resolve that trusted test root once
+        // so the transaction layer can keep rejecting symlink ancestors.
+        let temp_root = temp.path().canonicalize()?;
+        let source_config = temp_root.join("claude-home");
+        let source_repo = temp_root.join("source-repo");
         std::fs::create_dir_all(source_config.as_path())?;
         std::fs::create_dir_all(source_repo.join(".claude/skills/review"))?;
         std::fs::write(source_repo.join("CLAUDE.md"), "Keep public APIs stable.\n")?;
@@ -952,9 +956,9 @@ mod tests {
         let transported = super::unpack_assets(&verified)?;
         assert_eq!(transported.len(), 2);
 
-        let target_home = temp.path().join("target-home");
-        let target_config = temp.path().join("target-codex");
-        let target_repo = temp.path().join("target-repo");
+        let target_home = temp_root.join("target-home");
+        let target_config = temp_root.join("target-codex");
+        let target_repo = temp_root.join("target-repo");
         std::fs::create_dir_all(&target_repo)?;
         for asset in &transported {
             for rendered in mnemo_adapter_codex::render_target(asset)? {
@@ -967,7 +971,7 @@ mod tests {
                 let mut journal = mnemo_store::apply_file(
                     &target,
                     &rendered.bytes,
-                    &temp.path().join("transactions"),
+                    &temp_root.join("transactions"),
                     None,
                 )?;
                 assert_eq!(std::fs::read(&target)?, rendered.bytes);
