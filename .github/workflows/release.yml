@@ -59,7 +59,11 @@ jobs:
           mkdir -p dist/package
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/package/
           tar -C dist/package -czf "dist/${{ matrix.archive }}" "${{ matrix.binary }}"
-          shasum -a 256 "dist/${{ matrix.archive }}" > "dist/${{ matrix.archive }}.sha256"
+          (
+            cd dist
+            shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+            shasum -a 256 -c "${{ matrix.archive }}.sha256"
+          )
       - name: Package Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
