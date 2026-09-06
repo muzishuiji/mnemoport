@@ -93,7 +93,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp crates/mnemo-cli/mnemo.cdx.json dist/mnemoport.cdx.json
+          test -f crates/mnemo-cli/mnemo_bin.cdx.json
+          cp crates/mnemo-cli/mnemo_bin.cdx.json dist/mnemoport.cdx.json
       - uses: actions/upload-artifact@v4
         with:
           name: release-sbom
