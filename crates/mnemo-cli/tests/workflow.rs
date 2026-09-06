@@ -29,6 +29,10 @@ fn encrypted_cross_device_export_plan_apply_and_undo() -> Result<(), Box<dyn std
     std::fs::create_dir_all(source_workspace.join(".qoder/skills/portable"))?;
     std::fs::create_dir_all(&source_config)?;
     std::fs::create_dir_all(&target_workspace)?;
+    // macOS exposes the temporary root through `/var`, while child process
+    // current directories resolve to `/private/var`. Compare ownership using
+    // the same canonical locator the CLI records.
+    let target_workspace = target_workspace.canonicalize()?;
     std::fs::write(
         source_workspace.join("AGENTS.md"),
         "Preserve API compatibility.\n",
