@@ -69,7 +69,7 @@ jobs:
           Compress-Archive -Path "dist/package/${{ matrix.binary }}" -DestinationPath "dist/${{ matrix.archive }}"
           $digest = (Get-FileHash "dist/${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower()
           "$digest  ${{ matrix.archive }}" | Set-Content "dist/${{ matrix.archive }}.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: |
@@ -95,7 +95,7 @@ jobs:
           mkdir -p dist
           test -f crates/mnemo-cli/mnemo_bin.cdx.json
           cp crates/mnemo-cli/mnemo_bin.cdx.json dist/mnemoport.cdx.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-sbom
           path: dist/mnemoport.cdx.json
@@ -109,7 +109,7 @@ jobs:
       contents: read
       attestations: write
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: artifacts
@@ -134,7 +134,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: artifacts
