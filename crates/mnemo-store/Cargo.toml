@@ -10,7 +10,7 @@ repository.workspace = true
 directories.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
-mnemo-security = { path = "../mnemo-security" }
+mnemo-security = { version = "0.1.0", path = "../mnemo-security" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

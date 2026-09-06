@@ -88,12 +88,12 @@ jobs:
         with:
           toolchain: stable
       - run: cargo +stable install cargo-cyclonedx --version 0.5.9 --locked
-      - run: cargo +stable cyclonedx --manifest-path crates/mnemo-cli/Cargo.toml --format json --describe binaries --all-features --target all --override-filename mnemoport
+      - run: cargo +stable cyclonedx --manifest-path crates/mnemo-cli/Cargo.toml --format json --describe binaries --all-features --target all
       - name: Stage SBOM
         shell: bash
         run: |
           mkdir -p dist
-          cp crates/mnemo-cli/mnemoport.json dist/mnemoport.cdx.json
+          cp crates/mnemo-cli/mnemo.cdx.json dist/mnemoport.cdx.json
       - uses: actions/upload-artifact@v4
         with:
           name: release-sbom

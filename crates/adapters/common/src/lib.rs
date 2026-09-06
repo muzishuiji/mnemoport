@@ -1546,9 +1546,11 @@ pub fn detected_tuple(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::probe_version_with_timeout;
     use super::{
         ExtractedAsset, collect_json_mcp_if_present, collect_toml_mcp_if_present, extract_version,
-        merge_mcp_json, merge_mcp_toml, probe_version, probe_version_with_timeout,
+        merge_mcp_json, merge_mcp_toml, probe_version,
     };
     use mnemo_schema::{
         AssetPayload, Entrypoint, EvidenceLevel, Platform, ProbeStatus, ProductTuple, ScopeLevel,
