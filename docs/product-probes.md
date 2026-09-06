@@ -37,3 +37,16 @@ Qoder detection deliberately reports the CLI and Desktop as separate tuples. A D
 | `timed_out` | The process exceeded five seconds and was terminated |
 
 Any result other than `verified` makes the command return exit code `2`. Even `verified` upgrades only the version-level tuple evidence to `probe`; it does not upgrade Instructions, Skills, MCP, plugins, GUI, remote, or cloud capabilities.
+
+## Asset-level discovery gate
+
+An asset-level L1 recipe is admitted separately for each `product version × OS × entrypoint × asset kind`. Before it can become automatic, the recipe must have all of the following:
+
+- fixed vendor-owned arguments and a bounded parser for structured or version-gated output;
+- a fixture proving the product reports the exact migrated marker or identifier;
+- before/after filesystem evidence defining every permitted write;
+- proof that migrated MCP servers, plugins, hooks, agents, and scripts are not started;
+- credentials and provider environment removed unless the recipe is explicitly classified as account-assisted;
+- timeout, output limits, sanitized diagnostics, and a negative control that cannot pass from directory presence alone.
+
+A command named `list` is not automatically safe. If it performs health checks, synchronizes a marketplace, starts an MCP server, invokes a model, or requires account state, that step is L2/account-assisted and requires separate authorization. Products without a safe authoritative discovery surface remain at L0 with an explicit manual result.
