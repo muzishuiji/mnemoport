@@ -34,5 +34,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - run: cargo install cargo-audit --locked
-      - run: cargo audit
+      # The repository pins its MSRV in rust-toolchain.toml, so select stable
+      # explicitly for the independently versioned audit tool.
+      - run: cargo +stable install cargo-audit --locked
+      - run: cargo +stable audit

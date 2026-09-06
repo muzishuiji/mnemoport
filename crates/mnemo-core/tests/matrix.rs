@@ -9,8 +9,9 @@ use std::path::Path;
 fn all_sixteen_core_directions_survive_cross_device_package()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = tempfile::tempdir()?;
+    let fixture_root = fixture.path().canonicalize()?;
     for source in Platform::all() {
-        let source_assets = source_fixture(source, fixture.path())?;
+        let source_assets = source_fixture(source, &fixture_root)?;
         assert_eq!(source_assets.len(), 4, "source {}", source.as_str());
         let package = mnemo_core::package_assets(
             &source_assets,
@@ -20,11 +21,12 @@ fn all_sixteen_core_directions_survive_cross_device_package()
         let transported = mnemo_core::unpack_assets(&verified)?;
         for target in Platform::all() {
             let destination = tempfile::tempdir()?;
-            let transaction_root = destination.path().join("transactions");
+            let destination_root = destination.path().canonicalize()?;
+            let transaction_root = destination_root.join("transactions");
             let roots = mnemo_core::TargetRoots {
-                product_config: destination.path().join("product-config"),
-                user_home: destination.path().join("home"),
-                workspace: destination.path().join("workspace"),
+                product_config: destination_root.join("product-config"),
+                user_home: destination_root.join("home"),
+                workspace: destination_root.join("workspace"),
             };
             let prepared =
                 mnemo_core::prepare_migration(target_tuple(target), &roots, &transported)?;

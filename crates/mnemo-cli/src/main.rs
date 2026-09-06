@@ -1095,6 +1095,7 @@ fn set_private_permissions(file: &File) -> Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_private_permissions(_file: &File) -> Result<()> {
     Ok(())
 }
