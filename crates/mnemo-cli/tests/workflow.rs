@@ -416,6 +416,21 @@ fn inventory_uses_partial_exit_for_manual_assets() -> Result<(), Box<dyn std::er
 }
 
 #[test]
+fn recovery_list_is_read_only_when_no_prepared_journals_exist()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&workspace)?;
+    let output = run(&workspace, &state, &["recovery", "list", "--json"], &[])?;
+    let response = success_json(&output)?;
+    assert_eq!(response["phase"], "recovery-list");
+    assert_eq!(response["data"], serde_json::json!([]));
+    assert!(!state.join("data/mnemoport/transactions").exists());
+    Ok(())
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn handoff_package_installs_only_a_new_session_sidecar() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;

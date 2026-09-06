@@ -24,6 +24,8 @@ The Rust core owns deterministic schemas, path and content policy, package verif
 8. `report` reads operation and journal evidence from the local ledger.
 9. `undo` restores only unchanged post-apply targets.
 
+If a process stops between a synced `prepared` journal and its final `committed` journal, `doctor` and `recovery list` classify the target from exact before/current/after hashes. `recovery rollback` restores a verified backup or closes a transaction whose target never changed. A third state is reported as manual review and never changed automatically.
+
 For same-tool moves between devices, `handoff` packages a user-selected new-session capsule using the same signing and encryption path. The destination receives a Markdown sidecar; MnemoPort never injects a private session database.
 
 Plans are target-device artifacts. A cross-device package is created on source device A, while the plan is created on target device B so its preconditions describe the actual destination.
@@ -42,4 +44,4 @@ JSON commands return `0` only when the requested scope is fully complete, `2` wh
 
 ## Atomicity boundary
 
-Local file writes are Phase A and have strong byte-for-byte rollback. Network installs, OAuth, plugin marketplaces, and MCP execution are Phase B external actions and cannot share a universal atomicity promise. The alpha does not execute Phase B actions; it reports intent/manual work instead.
+Local file writes are Phase A and have strong byte-for-byte rollback. Backups are hash-verified again before undo or interrupted-process recovery. Network installs, OAuth, plugin marketplaces, and MCP execution are Phase B external actions and cannot share a universal atomicity promise. The alpha does not execute Phase B actions; it reports intent/manual work instead.

@@ -15,7 +15,7 @@ use mnemo_schema::{
     PlanOperationKind, PlanPrecondition, Platform, ProductTuple, RollbackGuarantee, Sensitivity,
 };
 use mnemo_security::{FindingSeverity, scan_and_redact, sha256_id, validate_portable_path};
-use mnemo_store::{StatePaths, resolve_state_paths};
+use mnemo_store::{RecoveryCandidate, StatePaths, resolve_state_paths, scan_recovery_candidates};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -35,6 +35,8 @@ pub struct DoctorReport {
     pub state_paths: Option<StatePaths>,
     /// Read-only platform detections.
     pub detections: Vec<ProductTuple>,
+    /// Prepared file transactions left by an interrupted process.
+    pub recovery_candidates: Vec<RecoveryCandidate>,
 }
 
 /// Core orchestration error.
@@ -49,6 +51,9 @@ pub enum CoreError {
     /// Package construction or verification failed.
     #[error(transparent)]
     Package(#[from] PackageError),
+    /// Local state or transaction recovery inspection failed.
+    #[error(transparent)]
+    Store(#[from] mnemo_store::StoreError),
     /// Package object graph is incomplete or inconsistent.
     #[error("invalid migration bundle: {0}")]
     InvalidBundle(String),
@@ -796,12 +801,18 @@ fn is_sha256_id(value: &str) -> bool {
 
 /// Run read-only diagnostics.
 pub fn doctor() -> Result<DoctorReport, CoreError> {
+    let state_paths = resolve_state_paths();
+    let recovery_candidates = state_paths.as_ref().map_or_else(
+        || Ok(Vec::new()),
+        |paths| scan_recovery_candidates(&paths.transactions),
+    )?;
     Ok(DoctorReport {
         version: env!("CARGO_PKG_VERSION"),
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
-        state_paths: resolve_state_paths(),
+        state_paths,
         detections: detect(None)?,
+        recovery_candidates,
     })
 }
 

@@ -178,6 +178,22 @@ mnemo undo <migration-id> --json
 
 Undo restores the pre-migration bytes only when the files still match the state MnemoPort wrote. If a target was edited afterward, undo refuses instead of discarding that work.
 
+### Interrupted-process recovery
+
+Every file replacement writes and syncs its rollback backup and `prepared` journal before replacing the target. `mnemo doctor --json` reports any prepared transactions left by a process or machine interruption. Inspect them without writing:
+
+```bash
+mnemo recovery list --json
+```
+
+Each candidate is classified from exact before/current/after hashes as `mark-rolled-back`, `restore-backup`, or `manual-review`. Explicitly close or restore one unambiguous transaction with:
+
+```bash
+mnemo recovery rollback <transaction-id> --json
+```
+
+Recovery verifies the journal location and rollback backup hash. It refuses `manual-review` when the target matches neither recorded state, so an external edit is never guessed away.
+
 ### New-session Handoff capsule
 
 Handoff carries a user-reviewed task summary into a fresh session without copying a product session database. Create JSON conforming to [`handoff.schema.json`](schemas/handoff.schema.json), then package it on the source device:
@@ -205,6 +221,8 @@ On the target, use the normal `inspect` → `plan` → `trust` → `apply` flow.
 | `mnemo verify --input FILE --plan PLAN` | No | Rebuild expected L0 bytes and compare target hashes |
 | `mnemo report ID` | No | Read operation status and journal count |
 | `mnemo undo MIGRATION_ID` | Yes | Restore unchanged targets from local backups |
+| `mnemo recovery list` | No | Classify prepared journals left by an interruption |
+| `mnemo recovery rollback TRANSACTION_ID` | Yes | Safely close or restore one unambiguous prepared transaction |
 | `mnemo integration install/status/uninstall` | Host Skill only | Manage the thin integration with ownership checks |
 | `mnemo handoff --input JSON --output FILE` | No | Package a user-selected new-session capsule |
 
@@ -259,6 +277,7 @@ The alpha does not yet perform network plugin/extension installation, CLI depend
 - **Plan drift or approval mismatch:** discard the plan, choose a new plan output filename, and run `plan` again against the current target.
 - **Output already exists:** MnemoPort does not overwrite package or plan files. Choose a new output path.
 - **Integration uninstall is refused:** the file is modified or lacks MnemoPort ownership proof. Preserve it and remove it manually only after reviewing its contents.
+- **`doctor` reports recovery candidates:** run `recovery list`, review the hashes and disposition, then explicitly roll back only an unambiguous transaction. Preserve `manual-review` targets for investigation.
 - **Need detailed local diagnostics:** rerun without `--json`; JSON mode intentionally emits stable, sanitized diagnostics.
 
 For security issues and sensitive-data handling, read [SECURITY.md](SECURITY.md).

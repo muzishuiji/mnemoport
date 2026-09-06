@@ -402,6 +402,46 @@ pub struct FileTransactionJournal {
     pub created_at_ms: i64,
 }
 
+/// Read-only classification of an interrupted prepared transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryDisposition {
+    /// The target still has its pre-transaction state; only the journal needs closing.
+    MarkRolledBack,
+    /// The target has the intended post-transaction bytes and can be restored safely.
+    RestoreBackup,
+    /// The target matches neither recorded state and requires user investigation.
+    ManualReview,
+}
+
+/// Evidence for one prepared transaction found after an interrupted process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryCandidate {
+    /// Transaction identifier and transaction-directory name.
+    pub transaction_id: String,
+    /// Target whose state was being changed.
+    pub target: PathBuf,
+    /// Hash before the attempted mutation, absent if the target was new.
+    pub before_hash: Option<String>,
+    /// Hash the transaction intended to install.
+    pub after_hash: String,
+    /// Hash currently found at the target, absent if it does not exist.
+    pub current_hash: Option<String>,
+    /// Safe action inferred only from exact hashes.
+    pub disposition: RecoveryDisposition,
+    /// Durable journal used for explicit recovery.
+    pub journal_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyCheckpoint {
+    BackupSynced,
+    PreparedJournalSynced,
+    TargetTemporarySynced,
+    TargetPersisted,
+    TargetDirectorySynced,
+}
+
 /// Apply one recoverable file replacement.
 ///
 /// A stale `expected_before_hash` rejects the mutation before any target write.
@@ -411,6 +451,22 @@ pub fn apply_file(
     new_bytes: &[u8],
     transaction_root: &Path,
     expected_before_hash: Option<&str>,
+) -> Result<FileTransactionJournal, StoreError> {
+    apply_file_inner(
+        target,
+        new_bytes,
+        transaction_root,
+        expected_before_hash,
+        |_| Ok(()),
+    )
+}
+
+fn apply_file_inner(
+    target: &Path,
+    new_bytes: &[u8],
+    transaction_root: &Path,
+    expected_before_hash: Option<&str>,
+    mut checkpoint: impl FnMut(ApplyCheckpoint) -> Result<(), StoreError>,
 ) -> Result<FileTransactionJournal, StoreError> {
     let parent = target
         .parent()
@@ -445,6 +501,7 @@ pub fn apply_file(
     } else {
         None
     };
+    checkpoint(ApplyCheckpoint::BackupSynced)?;
     let journal_path = transaction_dir.join("journal.json");
     let mut journal = FileTransactionJournal {
         id,
@@ -457,6 +514,7 @@ pub fn apply_file(
         created_at_ms: unix_millis()?,
     };
     save_journal(&journal)?;
+    checkpoint(ApplyCheckpoint::PreparedJournalSynced)?;
 
     let mut temporary = NamedTempFile::new_in(parent)?;
     temporary.write_all(new_bytes)?;
@@ -466,10 +524,13 @@ pub fn apply_file(
             .set_permissions(metadata.permissions())?;
     }
     temporary.as_file().sync_all()?;
+    checkpoint(ApplyCheckpoint::TargetTemporarySynced)?;
     temporary
         .persist(target)
         .map_err(|error| StoreError::Io(error.error))?;
+    checkpoint(ApplyCheckpoint::TargetPersisted)?;
     sync_directory(parent)?;
+    checkpoint(ApplyCheckpoint::TargetDirectorySynced)?;
 
     journal.status = TransactionStatus::Committed;
     save_journal(&journal)?;
@@ -495,15 +556,7 @@ pub fn undo_file(journal: &mut FileTransactionJournal, force: bool) -> Result<()
             actual: current,
         });
     }
-    if let Some(backup) = &journal.backup {
-        let bytes = fs::read(backup)?;
-        replace_file(&journal.target, &bytes)?;
-    } else if journal.target.exists() {
-        fs::remove_file(&journal.target)?;
-        if let Some(parent) = journal.target.parent() {
-            sync_directory(parent)?;
-        }
-    }
+    restore_before(journal)?;
     journal.status = TransactionStatus::RolledBack;
     save_journal(journal)?;
     Ok(())
@@ -512,6 +565,201 @@ pub fn undo_file(journal: &mut FileTransactionJournal, force: bool) -> Result<()
 /// Load a durable file transaction journal.
 pub fn load_journal(path: &Path) -> Result<FileTransactionJournal, StoreError> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+/// Find prepared journals left by an interrupted process without changing targets.
+pub fn scan_recovery_candidates(
+    transaction_root: &Path,
+) -> Result<Vec<RecoveryCandidate>, StoreError> {
+    let entries = match fs::read_dir(transaction_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let journal_path = entry.path().join("journal.json");
+        reject_symlink_ancestors(&journal_path)?;
+        let journal = match load_journal(&journal_path) {
+            Ok(journal) => journal,
+            Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        validate_recovery_journal(transaction_root, &journal_path, &journal)?;
+        if journal.status == TransactionStatus::Prepared {
+            candidates.push(classify_recovery(&journal));
+        }
+    }
+    candidates.sort_by(|left, right| left.transaction_id.cmp(&right.transaction_id));
+    Ok(candidates)
+}
+
+/// Roll back one prepared transaction only when exact hashes make recovery unambiguous.
+pub fn rollback_prepared_transaction(
+    transaction_root: &Path,
+    transaction_id: &str,
+) -> Result<FileTransactionJournal, StoreError> {
+    let parsed = Uuid::parse_str(transaction_id)
+        .map_err(|_| StoreError::InvalidState("invalid recovery transaction id".to_owned()))?;
+    if parsed.to_string() != transaction_id {
+        return Err(StoreError::InvalidState(
+            "recovery transaction id must use canonical UUID form".to_owned(),
+        ));
+    }
+    let journal_path = transaction_root.join(transaction_id).join("journal.json");
+    reject_symlink_ancestors(&journal_path)?;
+    let mut journal = load_journal(&journal_path)?;
+    validate_recovery_journal(transaction_root, &journal_path, &journal)?;
+    if journal.status != TransactionStatus::Prepared {
+        return Err(StoreError::InvalidState(format!(
+            "transaction {} is not awaiting recovery",
+            journal.id
+        )));
+    }
+    let candidate = classify_recovery(&journal);
+    match candidate.disposition {
+        RecoveryDisposition::MarkRolledBack => {}
+        RecoveryDisposition::RestoreBackup => restore_before(&journal)?,
+        RecoveryDisposition::ManualReview => {
+            return Err(StoreError::Precondition {
+                expected: Some(journal.after_hash.clone()),
+                actual: candidate.current_hash,
+            });
+        }
+    }
+    journal.status = TransactionStatus::RolledBack;
+    save_journal(&journal)?;
+    Ok(journal)
+}
+
+fn classify_recovery(journal: &FileTransactionJournal) -> RecoveryCandidate {
+    let current_hash = fs::read(&journal.target)
+        .ok()
+        .map(|bytes| sha256_id(&bytes));
+    let disposition = if current_hash == journal.before_hash {
+        RecoveryDisposition::MarkRolledBack
+    } else if current_hash.as_deref() == Some(journal.after_hash.as_str()) {
+        RecoveryDisposition::RestoreBackup
+    } else {
+        RecoveryDisposition::ManualReview
+    };
+    RecoveryCandidate {
+        transaction_id: journal.id.clone(),
+        target: journal.target.clone(),
+        before_hash: journal.before_hash.clone(),
+        after_hash: journal.after_hash.clone(),
+        current_hash,
+        disposition,
+        journal_path: journal.journal_path.clone(),
+    }
+}
+
+fn validate_recovery_journal(
+    transaction_root: &Path,
+    journal_path: &Path,
+    journal: &FileTransactionJournal,
+) -> Result<(), StoreError> {
+    let parsed = Uuid::parse_str(&journal.id)
+        .map_err(|_| StoreError::InvalidState("journal transaction id is invalid".to_owned()))?;
+    if parsed.to_string() != journal.id {
+        return Err(StoreError::InvalidState(
+            "journal transaction id is not canonical".to_owned(),
+        ));
+    }
+    let expected_dir = transaction_root.join(&journal.id);
+    let expected_journal = expected_dir.join("journal.json");
+    if journal_path != expected_journal || journal.journal_path != expected_journal {
+        return Err(StoreError::InvalidState(
+            "journal locator escapes its transaction directory".to_owned(),
+        ));
+    }
+    if !journal.target.is_absolute() {
+        return Err(StoreError::InvalidState(
+            "recovery target must be absolute".to_owned(),
+        ));
+    }
+    if fs::symlink_metadata(&journal.target).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(StoreError::UnsafePath(journal.target.clone()));
+    }
+    match (&journal.before_hash, &journal.backup) {
+        (Some(_), Some(path)) if path == &expected_dir.join("before.bin") => {}
+        (None, None) => {}
+        _ => {
+            return Err(StoreError::InvalidState(
+                "journal backup locator is inconsistent".to_owned(),
+            ));
+        }
+    }
+    reject_symlink_ancestors(&expected_dir)?;
+    Ok(())
+}
+
+fn restore_before(journal: &FileTransactionJournal) -> Result<(), StoreError> {
+    if let Some(expected_before) = journal.before_hash.as_deref() {
+        let backup = journal.backup.as_ref().ok_or_else(|| {
+            StoreError::InvalidState("existing target has no rollback backup".to_owned())
+        })?;
+        if fs::symlink_metadata(backup).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(StoreError::UnsafePath(backup.clone()));
+        }
+        let bytes = fs::read(backup)?;
+        let actual = sha256_id(&bytes);
+        if actual != expected_before {
+            return Err(StoreError::InvalidState(
+                "rollback backup hash does not match the journal".to_owned(),
+            ));
+        }
+        replace_file(&journal.target, &bytes)?;
+    } else {
+        if journal.backup.is_some() {
+            return Err(StoreError::InvalidState(
+                "new target journal unexpectedly contains a backup".to_owned(),
+            ));
+        }
+        if journal.target.exists() {
+            reject_symlink_ancestors(
+                journal
+                    .target
+                    .parent()
+                    .ok_or_else(|| StoreError::UnsafePath(journal.target.clone()))?,
+            )?;
+            fs::remove_file(&journal.target)?;
+            if let Some(parent) = journal.target.parent() {
+                sync_directory(parent)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn apply_file_with_fault(
+    target: &Path,
+    new_bytes: &[u8],
+    transaction_root: &Path,
+    expected_before_hash: Option<&str>,
+    failure_point: ApplyCheckpoint,
+) -> Result<FileTransactionJournal, StoreError> {
+    apply_file_inner(
+        target,
+        new_bytes,
+        transaction_root,
+        expected_before_hash,
+        |checkpoint| {
+            if checkpoint == failure_point {
+                Err(StoreError::InvalidState(format!(
+                    "injected failure at {checkpoint:?}"
+                )))
+            } else {
+                Ok(())
+            }
+        },
+    )
 }
 
 /// Load or create the local Ed25519 device identity. The raw secret never
@@ -753,7 +1001,11 @@ CREATE TABLE IF NOT EXISTS capability_snapshots (
 
 #[cfg(test)]
 mod tests {
-    use super::{Ledger, OperationStatus, StoreError, apply_file, load_journal, undo_file};
+    use super::{
+        ApplyCheckpoint, Ledger, OperationStatus, RecoveryDisposition, StoreError, apply_file,
+        apply_file_with_fault, load_journal, rollback_prepared_transaction,
+        scan_recovery_candidates, undo_file,
+    };
 
     #[test]
     fn ledger_tracks_terminal_operation() -> Result<(), Box<dyn std::error::Error>> {
@@ -791,6 +1043,145 @@ mod tests {
             load_journal(&journal.journal_path)?.status,
             super::TransactionStatus::RolledBack
         );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_closes_prepared_journals_before_target_persist()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for failure_point in [
+            ApplyCheckpoint::PreparedJournalSynced,
+            ApplyCheckpoint::TargetTemporarySynced,
+        ] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().canonicalize()?;
+            let target = root.join("config/settings.json");
+            let transactions = root.join("transactions");
+            std::fs::create_dir_all(target.parent().ok_or("target parent absent")?)?;
+            std::fs::write(&target, b"before")?;
+            let result = apply_file_with_fault(
+                &target,
+                b"after",
+                &transactions,
+                Some(&mnemo_security::sha256_id(b"before")),
+                failure_point,
+            );
+            assert!(matches!(result, Err(StoreError::InvalidState(_))));
+            assert_eq!(std::fs::read(&target)?, b"before");
+
+            let candidates = scan_recovery_candidates(&transactions)?;
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(
+                candidates[0].disposition,
+                RecoveryDisposition::MarkRolledBack
+            );
+            let recovered =
+                rollback_prepared_transaction(&transactions, &candidates[0].transaction_id)?;
+            assert_eq!(recovered.status, super::TransactionStatus::RolledBack);
+            assert_eq!(std::fs::read(&target)?, b"before");
+            assert!(scan_recovery_candidates(&transactions)?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_restores_backup_after_target_persist() -> Result<(), Box<dyn std::error::Error>> {
+        for failure_point in [
+            ApplyCheckpoint::TargetPersisted,
+            ApplyCheckpoint::TargetDirectorySynced,
+        ] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().canonicalize()?;
+            let target = root.join("settings.json");
+            let transactions = root.join("transactions");
+            std::fs::write(&target, b"before")?;
+            let result = apply_file_with_fault(
+                &target,
+                b"after",
+                &transactions,
+                Some(&mnemo_security::sha256_id(b"before")),
+                failure_point,
+            );
+            assert!(matches!(result, Err(StoreError::InvalidState(_))));
+            assert_eq!(std::fs::read(&target)?, b"after");
+
+            let candidates = scan_recovery_candidates(&transactions)?;
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(
+                candidates[0].disposition,
+                RecoveryDisposition::RestoreBackup
+            );
+            rollback_prepared_transaction(&transactions, &candidates[0].transaction_id)?;
+            assert_eq!(std::fs::read(&target)?, b"before");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_removes_a_new_target_but_refuses_external_drift()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let transactions = root.join("transactions");
+        let new_target = root.join("new.txt");
+        let result = apply_file_with_fault(
+            &new_target,
+            b"created",
+            &transactions,
+            None,
+            ApplyCheckpoint::TargetPersisted,
+        );
+        assert!(matches!(result, Err(StoreError::InvalidState(_))));
+        let candidate = scan_recovery_candidates(&transactions)?
+            .pop()
+            .ok_or("new target recovery candidate missing")?;
+        rollback_prepared_transaction(&transactions, &candidate.transaction_id)?;
+        assert!(!new_target.exists());
+
+        let drift_target = root.join("drift.txt");
+        std::fs::write(&drift_target, b"before")?;
+        let result = apply_file_with_fault(
+            &drift_target,
+            b"after",
+            &transactions,
+            Some(&mnemo_security::sha256_id(b"before")),
+            ApplyCheckpoint::TargetPersisted,
+        );
+        assert!(matches!(result, Err(StoreError::InvalidState(_))));
+        std::fs::write(&drift_target, b"external edit")?;
+        let candidate = scan_recovery_candidates(&transactions)?
+            .pop()
+            .ok_or("drift recovery candidate missing")?;
+        assert_eq!(candidate.disposition, RecoveryDisposition::ManualReview);
+        assert!(matches!(
+            rollback_prepared_transaction(&transactions, &candidate.transaction_id),
+            Err(StoreError::Precondition { .. })
+        ));
+        assert_eq!(std::fs::read(&drift_target)?, b"external edit");
+        Ok(())
+    }
+
+    #[test]
+    fn undo_rejects_a_tampered_backup() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let target = root.join("settings.json");
+        std::fs::write(&target, b"before")?;
+        let mut journal = apply_file(
+            &target,
+            b"after",
+            &root.join("transactions"),
+            Some(&mnemo_security::sha256_id(b"before")),
+        )?;
+        std::fs::write(
+            journal.backup.as_ref().ok_or("backup missing")?,
+            b"tampered",
+        )?;
+        assert!(matches!(
+            undo_file(&mut journal, false),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert_eq!(std::fs::read(&target)?, b"after");
         Ok(())
     }
 

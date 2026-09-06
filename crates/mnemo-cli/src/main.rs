@@ -138,6 +138,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect or explicitly roll back interrupted prepared file transactions.
+    Recovery {
+        /// Recovery action.
+        #[command(subcommand)]
+        action: RecoveryAction,
+    },
     /// Install, inspect, or remove the thin host Skill.
     Integration {
         /// Integration action.
@@ -161,6 +167,24 @@ enum Command {
         /// Explicitly allow an unencrypted non-sensitive fixture.
         #[arg(long)]
         allow_plaintext: bool,
+        /// Emit the stable JSON response envelope.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RecoveryAction {
+    /// List prepared transactions and hash-derived safe dispositions without writing.
+    List {
+        /// Emit the stable JSON response envelope.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Roll back one prepared transaction if its target matches a recorded state.
+    Rollback {
+        /// Canonical transaction UUID reported by doctor or recovery list.
+        transaction_id: String,
         /// Emit the stable JSON response envelope.
         #[arg(long)]
         json: bool,
@@ -514,6 +538,32 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Report { operation_id, json } => {
             emit(json, "report", operation_report(&operation_id)?)?;
         }
+        Command::Recovery { action } => match action {
+            RecoveryAction::List { json } => {
+                let state =
+                    mnemo_store::resolve_state_paths().context("state paths unavailable")?;
+                emit(
+                    json,
+                    "recovery-list",
+                    mnemo_store::scan_recovery_candidates(&state.transactions)?,
+                )?;
+            }
+            RecoveryAction::Rollback {
+                transaction_id,
+                json,
+            } => {
+                let state =
+                    mnemo_store::resolve_state_paths().context("state paths unavailable")?;
+                emit(
+                    json,
+                    "recovery-rollback",
+                    mnemo_store::rollback_prepared_transaction(
+                        &state.transactions,
+                        &transaction_id,
+                    )?,
+                )?;
+            }
+        },
         Command::Integration { action } => match action {
             IntegrationAction::Install { host, scope, json } => {
                 emit(
@@ -605,6 +655,7 @@ fn command_phase(command: &Command) -> &'static str {
         Command::Verify { .. } => "verify",
         Command::Undo { .. } => "undo",
         Command::Report { .. } => "report",
+        Command::Recovery { .. } => "recovery",
         Command::Integration { .. } => "integration",
         Command::Trust { .. } => "trust",
         Command::Handoff { .. } => "handoff",
