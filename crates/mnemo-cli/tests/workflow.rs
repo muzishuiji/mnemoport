@@ -262,6 +262,77 @@ fn integration_uninstall_refuses_modified_user_content() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn every_host_integration_installs_reports_and_uninstalls_in_both_scopes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let state = temp.path().join("state");
+    for host in ["claude-code", "codex", "qoder", "cursor"] {
+        for scope in ["user", "project"] {
+            let workspace = temp.path().join(format!("workspace-{host}-{scope}"));
+            std::fs::create_dir_all(&workspace)?;
+            let installed = success_json(&run(
+                &workspace,
+                &state,
+                &[
+                    "integration",
+                    "install",
+                    "--host",
+                    host,
+                    "--scope",
+                    scope,
+                    "--json",
+                ],
+                &[],
+            )?)?;
+            assert_eq!(installed["data"]["host"], host);
+            assert_eq!(installed["data"]["scope"], scope);
+            assert_eq!(installed["data"]["status"], "installed");
+            let path = installed["data"]["path"]
+                .as_str()
+                .ok_or("integration path missing")?;
+            assert!(Path::new(path).is_file(), "missing {host}/{scope} Skill");
+
+            let status = success_json(&run(
+                &workspace,
+                &state,
+                &[
+                    "integration",
+                    "status",
+                    "--host",
+                    host,
+                    "--scope",
+                    scope,
+                    "--json",
+                ],
+                &[],
+            )?)?;
+            assert_eq!(status["data"]["status"], "present-unmodified");
+
+            let removed = success_json(&run(
+                &workspace,
+                &state,
+                &[
+                    "integration",
+                    "uninstall",
+                    "--host",
+                    host,
+                    "--scope",
+                    scope,
+                    "--json",
+                ],
+                &[],
+            )?)?;
+            assert_eq!(removed["data"]["status"], "uninstalled-reinstallable");
+            assert!(
+                !Path::new(path).exists(),
+                "left {host}/{scope} Skill behind"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn json_failures_have_stable_diagnostics_and_exit_codes() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp = tempfile::tempdir()?;
@@ -423,6 +494,10 @@ fn run(
 ) -> Result<Output, Box<dyn std::error::Error>> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mnemo"));
     command.current_dir(current_dir).args(arguments);
+    command.env("HOME", state_root.join("home"));
+    command.env("USERPROFILE", state_root.join("home"));
+    command.env("APPDATA", state_root.join("app-data"));
+    command.env("LOCALAPPDATA", state_root.join("local-app-data"));
     command.env("XDG_DATA_HOME", state_root.join("data"));
     command.env("XDG_CONFIG_HOME", state_root.join("config"));
     command.env("XDG_CACHE_HOME", state_root.join("cache"));
