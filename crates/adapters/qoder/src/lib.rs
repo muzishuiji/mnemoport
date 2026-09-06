@@ -5,7 +5,7 @@ use mnemo_adapter_common::{
     TargetRoot, collect_json_mcp_if_present, collect_markdown_tree, collect_skills,
     collect_text_if_present, detected_tuple, find_executable, inventory_only_if_present,
     merge_mcp_json, portable_name, render_file_tree, render_handoff, render_text_file,
-    resolve_root,
+    resolve_root, user_home,
 };
 use mnemo_schema::{AssetKind, Entrypoint, Platform, ProductTuple, ScopeLevel};
 use std::path::{Path, PathBuf};
@@ -21,17 +21,31 @@ impl PlatformAdapter for QoderAdapter {
 
     fn detect(&self) -> Result<Vec<ProductTuple>, AdapterError> {
         let root = resolve_root("QODER_CONFIG_DIR", ".qoder")?;
-        let executable = find_executable("qoder");
-        let entrypoint = executable.as_deref().map_or(Entrypoint::Unknown, |path| {
+        let dispatcher = find_executable("qoder");
+        let dispatcher_entrypoint = dispatcher.as_deref().map_or(Entrypoint::Unknown, |path| {
             let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
             classify_entrypoint(&canonical)
         });
-        Ok(vec![detected_tuple(
+        let cli = find_qoder_cli(&root.path)?.or_else(|| {
+            (dispatcher_entrypoint == Entrypoint::Cli)
+                .then(|| dispatcher.clone())
+                .flatten()
+        });
+        let mut tuples = vec![detected_tuple(
             Platform::Qoder,
-            entrypoint,
-            executable,
-            root,
-        )])
+            Entrypoint::Cli,
+            cli,
+            root.clone(),
+        )];
+        if dispatcher_entrypoint != Entrypoint::Cli && dispatcher.is_some() {
+            tuples.push(detected_tuple(
+                Platform::Qoder,
+                dispatcher_entrypoint,
+                dispatcher,
+                root,
+            ));
+        }
+        Ok(tuples)
     }
 
     fn inventory(&self, mode: CollectionMode) -> Result<Vec<InventoryItem>, AdapterError> {
@@ -229,21 +243,62 @@ fn current_directory() -> Result<PathBuf, AdapterError> {
     })
 }
 
+fn find_qoder_cli(config_root: &Path) -> Result<Option<PathBuf>, AdapterError> {
+    if let Some(path) = find_executable("qodercli") {
+        return Ok(Some(path));
+    }
+    let home = user_home()?;
+    for candidate in [
+        executable_candidate(&home.join(".local/bin/qodercli")),
+        executable_candidate(&config_root.join("bin/qodercli/qodercli")),
+    ] {
+        if is_executable_candidate(&candidate) {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn executable_candidate(path: &Path) -> PathBuf {
+    if cfg!(windows) {
+        path.with_extension("exe")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn is_executable_candidate(path: &Path) -> bool {
+    path.metadata().is_ok_and(|metadata| {
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    })
+}
+
 fn classify_entrypoint(path: &Path) -> Entrypoint {
     let normalized = path
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
-    if normalized.contains("/opt/qoder/")
-        || normalized.contains("/applications/qoder.app/")
-        || normalized.ends_with("/qoder.exe")
-    {
-        Entrypoint::DesktopApp
-    } else if normalized.contains("node_modules")
+    if normalized.contains("node_modules")
         || normalized.contains("/.npm/")
         || normalized.contains("/.local/bin/")
     {
         Entrypoint::Cli
+    } else if normalized.contains("/opt/qoder/")
+        || normalized.contains("/applications/qoder.app/")
+        || (normalized.contains("/programs/qoder/") && normalized.ends_with("/qoder.exe"))
+    {
+        Entrypoint::DesktopApp
     } else {
         Entrypoint::Unknown
     }
@@ -267,6 +322,18 @@ mod tests {
                 "/usr/lib/node_modules/@qoder-ai/qodercli/bin/qoder"
             )),
             Entrypoint::Cli
+        );
+        assert_eq!(
+            classify_entrypoint(Path::new(
+                r"C:\Users\fixture\node_modules\@qoder-ai\qodercli\bin\qoder.exe"
+            )),
+            Entrypoint::Cli
+        );
+        assert_eq!(
+            classify_entrypoint(Path::new(
+                r"C:\Users\fixture\AppData\Local\Programs\Qoder\Qoder.exe"
+            )),
+            Entrypoint::DesktopApp
         );
     }
 

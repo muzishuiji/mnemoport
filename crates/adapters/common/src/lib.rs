@@ -2,14 +2,19 @@
 
 use mnemo_schema::{
     AssetKind, AssetPayload, AssetProvenance, CanonicalAsset, Entrypoint, EvidenceLevel,
-    McpServerAsset, Platform, ProductTuple, ScopeLevel, Sensitivity,
+    McpServerAsset, Platform, ProbeMethod, ProbeStatus, ProductProbe, ProductTuple, ScopeLevel,
+    Sensitivity,
 };
 use mnemo_security::{SecurityError, scan_and_redact, sha256_id, validate_portable_path};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 /// Collection modes with increasing side-effect permissions.
@@ -424,12 +429,295 @@ pub trait PlatformAdapter: Send + Sync {
     fn platform(&self) -> Platform;
     /// Detect product tuples without starting the product.
     fn detect(&self) -> Result<Vec<ProductTuple>, AdapterError>;
+    /// Run explicit, adapter-approved version-level L1 probes. The default
+    /// implementation never initializes migrated assets or invokes a shell.
+    fn probe(&self) -> Result<Vec<ProductProbe>, AdapterError> {
+        Ok(self.detect()?.into_iter().map(probe_version).collect())
+    }
     /// Return metadata only. M0 adapters may return an empty inventory.
     fn inventory(&self, mode: CollectionMode) -> Result<Vec<InventoryItem>, AdapterError>;
     /// Extract supported canonical assets. Unsupported categories must remain
     /// visible in inventory rather than being guessed here.
     fn extract(&self, _mode: CollectionMode) -> Result<Vec<ExtractedAsset>, AdapterError> {
         Ok(Vec::new())
+    }
+}
+
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_OUTPUT_LIMIT: u64 = 8 * 1024;
+const PROBE_OUTPUT_LIMIT_USIZE: usize = 8 * 1024;
+
+/// Run the single fixed `--version` probe permitted for supported entrypoints.
+/// The child receives a disposable home and a small environment allowlist.
+#[must_use]
+pub fn probe_version(tuple: ProductTuple) -> ProductProbe {
+    let Some(executable) = tuple.executable.clone() else {
+        return probe_result(
+            tuple,
+            ProbeStatus::Unavailable,
+            ProbeMethod::None,
+            Vec::new(),
+            "executable_unavailable",
+            false,
+        );
+    };
+    if !approved_version_entrypoint(tuple.platform, &tuple.entrypoint) {
+        return probe_result(
+            tuple,
+            ProbeStatus::UnsupportedEntrypoint,
+            ProbeMethod::None,
+            Vec::new(),
+            "entrypoint_not_safe_for_automatic_probe",
+            false,
+        );
+    }
+
+    probe_version_with_timeout(tuple, &executable, PROBE_TIMEOUT)
+}
+
+fn probe_version_with_timeout(
+    tuple: ProductTuple,
+    executable: &Path,
+    timeout: Duration,
+) -> ProductProbe {
+    let scratch = probe_scratch_path();
+    if fs::create_dir(&scratch).is_err() {
+        return probe_result(
+            tuple,
+            ProbeStatus::Failed,
+            ProbeMethod::VersionCommand,
+            vec!["--version".to_owned()],
+            "isolated_home_create_failed",
+            false,
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&scratch, fs::Permissions::from_mode(0o700));
+    }
+
+    let stdout_path = scratch.join("stdout");
+    let stderr_path = scratch.join("stderr");
+    let Ok(command) = prepare_probe_command(executable, &scratch, &stdout_path, &stderr_path)
+    else {
+        let _ = fs::remove_dir_all(&scratch);
+        return probe_result(
+            tuple,
+            ProbeStatus::Failed,
+            ProbeMethod::VersionCommand,
+            vec!["--version".to_owned()],
+            "probe_output_create_failed",
+            true,
+        );
+    };
+    let result = run_bounded(command, timeout);
+    let output = read_probe_output(&stdout_path, &stderr_path);
+    let _ = fs::remove_dir_all(&scratch);
+    finish_probe(tuple, result, output)
+}
+
+fn prepare_probe_command(
+    executable: &Path,
+    scratch: &Path,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> std::io::Result<Command> {
+    let stdout = File::create(stdout_path)?;
+    let stderr = File::create(stderr_path)?;
+    let mut command = Command::new(executable);
+    command
+        .arg("--version")
+        .env_clear()
+        .env("HOME", scratch)
+        .env("USERPROFILE", scratch)
+        .env("XDG_CONFIG_HOME", scratch.join("config"))
+        .env("XDG_CACHE_HOME", scratch.join("cache"))
+        .env("XDG_DATA_HOME", scratch.join("data"))
+        .env("APPDATA", scratch.join("appdata"))
+        .env("LOCALAPPDATA", scratch.join("local-appdata"))
+        .env("TMP", scratch)
+        .env("TEMP", scratch)
+        .env("TMPDIR", scratch)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    copy_environment_if_present(&mut command, "PATH");
+    copy_environment_if_present(&mut command, "SYSTEMROOT");
+    copy_environment_if_present(&mut command, "WINDIR");
+    Ok(command)
+}
+
+fn finish_probe(
+    mut tuple: ProductTuple,
+    execution: ProbeExecution,
+    output: std::io::Result<Vec<u8>>,
+) -> ProductProbe {
+    match (execution, output) {
+        (ProbeExecution::Completed { success: true }, Ok(output)) => {
+            if let Some(version) = extract_version(&output) {
+                tuple.version = Some(version);
+                tuple.evidence = EvidenceLevel::Probe;
+                probe_result(
+                    tuple,
+                    ProbeStatus::Verified,
+                    ProbeMethod::VersionCommand,
+                    vec!["--version".to_owned()],
+                    "version_recognized",
+                    true,
+                )
+            } else {
+                probe_result(
+                    tuple,
+                    ProbeStatus::Failed,
+                    ProbeMethod::VersionCommand,
+                    vec!["--version".to_owned()],
+                    "version_unrecognized",
+                    true,
+                )
+            }
+        }
+        (ProbeExecution::Completed { success: true }, Err(_)) => probe_result(
+            tuple,
+            ProbeStatus::Failed,
+            ProbeMethod::VersionCommand,
+            vec!["--version".to_owned()],
+            "probe_output_read_failed",
+            true,
+        ),
+        (ProbeExecution::Completed { success: false }, _) => probe_result(
+            tuple,
+            ProbeStatus::Failed,
+            ProbeMethod::VersionCommand,
+            vec!["--version".to_owned()],
+            "version_command_failed",
+            true,
+        ),
+        (ProbeExecution::TimedOut, _) => probe_result(
+            tuple,
+            ProbeStatus::TimedOut,
+            ProbeMethod::VersionCommand,
+            vec!["--version".to_owned()],
+            "version_command_timed_out",
+            true,
+        ),
+        (ProbeExecution::SpawnFailed, _) => probe_result(
+            tuple,
+            ProbeStatus::Failed,
+            ProbeMethod::VersionCommand,
+            vec!["--version".to_owned()],
+            "version_command_spawn_failed",
+            true,
+        ),
+    }
+}
+
+fn approved_version_entrypoint(platform: Platform, entrypoint: &Entrypoint) -> bool {
+    matches!(
+        (platform, entrypoint),
+        (
+            Platform::ClaudeCode | Platform::Codex | Platform::Qoder,
+            Entrypoint::Cli
+        ) | (Platform::Cursor, Entrypoint::Agent | Entrypoint::IdeEditor)
+    )
+}
+
+fn probe_result(
+    tuple: ProductTuple,
+    status: ProbeStatus,
+    method: ProbeMethod,
+    arguments: Vec<String>,
+    diagnostic: &str,
+    isolated_home: bool,
+) -> ProductProbe {
+    ProductProbe {
+        tuple,
+        status,
+        method,
+        arguments,
+        diagnostic: diagnostic.to_owned(),
+        isolated_home,
+        migrated_components_started: false,
+    }
+}
+
+enum ProbeExecution {
+    Completed { success: bool },
+    TimedOut,
+    SpawnFailed,
+}
+
+fn run_bounded(mut command: Command, timeout: Duration) -> ProbeExecution {
+    let Ok(mut child) = command.spawn() else {
+        return ProbeExecution::SpawnFailed;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return ProbeExecution::Completed {
+                    success: status.success(),
+                };
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ProbeExecution::TimedOut;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ProbeExecution::SpawnFailed;
+            }
+        }
+    }
+}
+
+fn read_probe_output(stdout_path: &Path, stderr_path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    File::open(stdout_path)?
+        .take(PROBE_OUTPUT_LIMIT)
+        .read_to_end(&mut output)?;
+    if output.len() < PROBE_OUTPUT_LIMIT_USIZE {
+        let remaining = PROBE_OUTPUT_LIMIT
+            .saturating_sub(u64::try_from(output.len()).unwrap_or(PROBE_OUTPUT_LIMIT));
+        File::open(stderr_path)?
+            .take(remaining)
+            .read_to_end(&mut output)?;
+    }
+    Ok(output)
+}
+
+fn extract_version(output: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(output);
+    text.lines()
+        .flat_map(str::split_whitespace)
+        .map(|token| {
+            token.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '.' | '-' | '_' | '+')
+            })
+        })
+        .find(|token| {
+            token.len() <= 128
+                && token.chars().any(|character| character.is_ascii_digit())
+                && token.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '+')
+                })
+        })
+        .map(str::to_owned)
+}
+
+fn probe_scratch_path() -> PathBuf {
+    let epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    std::env::temp_dir().join(format!("mnemoport-probe-{}-{epoch}", std::process::id()))
+}
+
+fn copy_environment_if_present(command: &mut Command, name: &str) {
+    if let Some(value) = std::env::var_os(name) {
+        command.env(name, value);
     }
 }
 
@@ -1259,10 +1547,13 @@ pub fn detected_tuple(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExtractedAsset, collect_json_mcp_if_present, collect_toml_mcp_if_present, merge_mcp_json,
-        merge_mcp_toml,
+        ExtractedAsset, collect_json_mcp_if_present, collect_toml_mcp_if_present, extract_version,
+        merge_mcp_json, merge_mcp_toml, probe_version, probe_version_with_timeout,
     };
-    use mnemo_schema::{AssetPayload, Platform, ScopeLevel, Sensitivity};
+    use mnemo_schema::{
+        AssetPayload, Entrypoint, EvidenceLevel, Platform, ProbeStatus, ProductTuple, ScopeLevel,
+        Sensitivity,
+    };
 
     #[test]
     fn json_mcp_extraction_keeps_refs_not_values() -> Result<(), Box<dyn std::error::Error>> {
@@ -1357,6 +1648,106 @@ http_headers = { X-Tenant = "private-value" }
             .is_err()
         );
         assert!(extracted.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_supported_version_output_without_returning_raw_text() {
+        for (output, expected) in [
+            ("2.1.259 (Claude Code)\n", "2.1.259"),
+            ("codex-cli 0.144.1\n", "0.144.1"),
+            ("2026.09.02-c22c1a3\n", "2026.09.02-c22c1a3"),
+        ] {
+            assert_eq!(
+                extract_version(output.as_bytes()).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(extract_version(b"product version unknown"), None);
+    }
+
+    #[test]
+    fn probe_reports_absent_and_unsupported_entrypoints_without_execution() {
+        let absent = probe_version(ProductTuple {
+            platform: Platform::ClaudeCode,
+            version: None,
+            os: "fixture".to_owned(),
+            entrypoint: Entrypoint::Cli,
+            executable: None,
+            config_root: None,
+            evidence: EvidenceLevel::Documented,
+        });
+        assert_eq!(absent.status, ProbeStatus::Unavailable);
+        assert!(!absent.isolated_home);
+
+        let desktop = probe_version(ProductTuple {
+            platform: Platform::Qoder,
+            version: None,
+            os: "fixture".to_owned(),
+            entrypoint: Entrypoint::DesktopApp,
+            executable: Some("must-not-run".into()),
+            config_root: None,
+            evidence: EvidenceLevel::Documented,
+        });
+        assert_eq!(desktop.status, ProbeStatus::UnsupportedEntrypoint);
+        assert!(desktop.arguments.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_executes_only_the_fixed_version_argument_in_an_isolated_home()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let executable = temp.path().join("fixture-product");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\ntest \"$1\" = \"--version\" || exit 40\ntest -n \"$HOME\" || exit 41\ntest -z \"$MNEMOPORT_FAKE_SECRET\" || exit 42\nprintf 'fixture-cli 7.8.9\\n'\n",
+        )?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+        let report = probe_version(ProductTuple {
+            platform: Platform::Codex,
+            version: None,
+            os: "fixture".to_owned(),
+            entrypoint: Entrypoint::Cli,
+            executable: Some(executable),
+            config_root: None,
+            evidence: EvidenceLevel::Documented,
+        });
+        assert_eq!(report.status, ProbeStatus::Verified);
+        assert_eq!(report.tuple.version.as_deref(), Some("7.8.9"));
+        assert_eq!(report.arguments, ["--version"]);
+        assert!(report.isolated_home);
+        assert!(!report.migrated_components_started);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_terminates_a_slow_version_command() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir()?;
+        let executable = temp.path().join("slow-product");
+        std::fs::write(&executable, "#!/bin/sh\nwhile :; do :; done\n")?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+        let report = probe_version_with_timeout(
+            ProductTuple {
+                platform: Platform::ClaudeCode,
+                version: None,
+                os: "fixture".to_owned(),
+                entrypoint: Entrypoint::Cli,
+                executable: Some(executable.clone()),
+                config_root: None,
+                evidence: EvidenceLevel::Documented,
+            },
+            &executable,
+            Duration::from_millis(40),
+        );
+        assert_eq!(report.status, ProbeStatus::TimedOut);
+        assert_eq!(report.tuple.version, None);
         Ok(())
     }
 }

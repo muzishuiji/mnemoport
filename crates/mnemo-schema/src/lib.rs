@@ -109,6 +109,51 @@ pub struct ProductTuple {
     pub evidence: EvidenceLevel,
 }
 
+/// Terminal state of an explicit local product probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeStatus {
+    /// The approved probe returned a recognized product version.
+    Verified,
+    /// No executable is installed for this tuple.
+    Unavailable,
+    /// MnemoPort will not execute this entrypoint automatically.
+    UnsupportedEntrypoint,
+    /// The executable could not be started or returned unusable output.
+    Failed,
+    /// The executable exceeded the fixed local timeout and was terminated.
+    TimedOut,
+}
+
+/// Mechanism used by a local product probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeMethod {
+    /// No command was run.
+    None,
+    /// The adapter-approved product `--version` command was run.
+    VersionCommand,
+}
+
+/// Version-level L1 evidence for one exact product entrypoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductProbe {
+    /// Exact product tuple, with version populated only after a verified probe.
+    pub tuple: ProductTuple,
+    /// Probe outcome.
+    pub status: ProbeStatus,
+    /// Probe mechanism.
+    pub method: ProbeMethod,
+    /// Fixed adapter-owned arguments; asset content never contributes here.
+    pub arguments: Vec<String>,
+    /// Stable diagnostic code without captured product output.
+    pub diagnostic: String,
+    /// Whether a disposable home directory was used.
+    pub isolated_home: bool,
+    /// Always false for L1; migrated components are never initialized.
+    pub migrated_components_started: bool,
+}
+
 /// Canonical asset kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

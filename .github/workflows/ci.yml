@@ -38,3 +38,13 @@ jobs:
       # explicitly for the independently versioned audit tool.
       - run: cargo +stable install cargo-audit --locked
       - run: cargo +stable audit
+
+  dependency-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: "1.85.0"
+          command: check
+          arguments: --all-features

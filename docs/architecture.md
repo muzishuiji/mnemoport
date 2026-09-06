@@ -26,6 +26,8 @@ The Rust core owns deterministic schemas, path and content policy, package verif
 
 If a process stops between a synced `prepared` journal and its final `committed` journal, `doctor` and `recovery list` classify the target from exact before/current/after hashes. `recovery rollback` restores a verified backup or closes a transaction whose target never changed. A third state is reported as manual review and never changed automatically.
 
+Product discovery is also split by effect. `detect` only resolves files and executables. The explicit `probe` path runs a bounded adapter-owned `--version` command in a disposable home and records entrypoint-specific version evidence. It does not initialize migrated components, and its success cannot be promoted to asset-level discovery evidence.
+
 For same-tool moves between devices, `handoff` packages a user-selected new-session capsule using the same signing and encryption path. The destination receives a Markdown sidecar; MnemoPort never injects a private session database.
 
 Plans are target-device artifacts. A cross-device package is created on source device A, while the plan is created on target device B so its preconditions describe the actual destination.

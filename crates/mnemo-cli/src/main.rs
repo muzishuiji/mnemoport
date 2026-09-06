@@ -4,7 +4,9 @@ use age::secrecy::SecretString;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use mnemo_adapter_common::CollectionMode;
-use mnemo_schema::{CommandResponse, Diagnostic, MigrationPlan, PlanOperationKind, Platform};
+use mnemo_schema::{
+    CommandResponse, Diagnostic, MigrationPlan, PlanOperationKind, Platform, ProbeStatus,
+};
 use mnemo_store::{Ledger, ManagedObjectRecord, OperationStatus, TransactionStatus};
 use serde::Serialize;
 use std::fs::{self, File};
@@ -29,6 +31,15 @@ enum Command {
     },
     /// Detect one or all supported AI products without launching them.
     Detect {
+        /// Optional platform identifier.
+        #[arg(long, value_parser = parse_platform)]
+        platform: Option<Platform>,
+        /// Emit the stable JSON response envelope.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run explicit version-level L1 probes without loading migrated assets.
+    Probe {
         /// Optional platform identifier.
         #[arg(long, value_parser = parse_platform)]
         platform: Option<Platform>,
@@ -388,6 +399,16 @@ fn run(cli: Cli) -> Result<u8> {
             let report = mnemo_core::detect(platform).context("detection failed")?;
             emit(json, "detect", report)?;
         }
+        Command::Probe { platform, json } => {
+            let report = mnemo_core::probe(platform).context("product probe failed")?;
+            if report
+                .iter()
+                .any(|item| item.status != ProbeStatus::Verified)
+            {
+                outcome = 2;
+            }
+            emit(json, "probe", report)?;
+        }
         Command::Inventory {
             from,
             invoked_by: _,
@@ -647,6 +668,7 @@ fn command_phase(command: &Command) -> &'static str {
     match command {
         Command::Doctor { .. } => "doctor",
         Command::Detect { .. } => "detect",
+        Command::Probe { .. } => "probe",
         Command::Inventory { .. } => "inventory",
         Command::Export { .. } => "export",
         Command::Inspect { .. } => "inspect",
@@ -1166,6 +1188,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
     use mnemo_schema::Platform;
 
     #[test]
@@ -1173,5 +1196,18 @@ mod tests {
         assert!(super::validate_target_host(Some(Platform::Codex), Platform::Codex).is_ok());
         assert!(super::validate_target_host(None, Platform::Codex).is_ok());
         assert!(super::validate_target_host(Some(Platform::Cursor), Platform::Codex).is_err());
+    }
+
+    #[test]
+    fn probe_platform_is_parsed_as_an_explicit_command() -> Result<(), Box<dyn std::error::Error>> {
+        let cli = super::Cli::try_parse_from(["mnemo", "probe", "--platform", "cursor", "--json"])?;
+        assert!(matches!(
+            cli.command,
+            super::Command::Probe {
+                platform: Some(Platform::Cursor),
+                json: true
+            }
+        ));
+        Ok(())
     }
 }

@@ -12,7 +12,8 @@ use mnemo_adapter_qoder::QoderAdapter;
 use mnemo_package::{PackageBuilder, PackageError, SignedPackage, VerifiedPackage};
 use mnemo_schema::{
     ApplyPhase, ApprovalClass, AssetKind, AssetPayload, MigrationPlan, PlanOperation,
-    PlanOperationKind, PlanPrecondition, Platform, ProductTuple, RollbackGuarantee, Sensitivity,
+    PlanOperationKind, PlanPrecondition, Platform, ProductProbe, ProductTuple, RollbackGuarantee,
+    Sensitivity,
 };
 use mnemo_security::{FindingSeverity, scan_and_redact, sha256_id, validate_portable_path};
 use mnemo_store::{RecoveryCandidate, StatePaths, resolve_state_paths, scan_recovery_candidates};
@@ -506,6 +507,18 @@ pub fn detect(platform: Option<Platform>) -> Result<Vec<ProductTuple>, CoreError
         }
     }
     Ok(detections)
+}
+
+/// Run explicit version-level L1 probes for all matching entrypoints. Each
+/// adapter owns its fixed command; asset bytes can never influence execution.
+pub fn probe(platform: Option<Platform>) -> Result<Vec<ProductProbe>, CoreError> {
+    let mut reports = Vec::new();
+    for adapter in adapters() {
+        if platform.is_none_or(|requested| requested == adapter.platform()) {
+            reports.extend(adapter.probe()?);
+        }
+    }
+    Ok(reports)
 }
 
 /// Inventory one platform without extracting asset bodies.

@@ -11,6 +11,20 @@
     "target_entrypoint": "filesystem-contract",
     "evidence": "l0-fixture"
   },
+  "native_probe_observation": {
+    "observed_on": "2026-09-06",
+    "os": "linux",
+    "level": "l1-version",
+    "boundary": "A successful version probe does not imply asset-level discovery.",
+    "tuples": [
+      { "platform": "claude-code", "entrypoint": "cli", "version": "2.1.259", "status": "verified" },
+      { "platform": "codex", "entrypoint": "cli", "version": "0.144.1", "status": "verified" },
+      { "platform": "qoder", "entrypoint": "cli", "version": null, "status": "unavailable" },
+      { "platform": "qoder", "entrypoint": "desktop-app", "version": null, "status": "unsupported_entrypoint" },
+      { "platform": "cursor", "entrypoint": "agent", "version": "2026.09.02-c22c1a3", "status": "verified" },
+      { "platform": "cursor", "entrypoint": "ide-editor", "version": "3.17.21", "status": "verified" }
+    ]
+  },
   "directions": [
     { "source": "claude-code", "target": "claude-code", "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
     { "source": "claude-code", "target": "codex",       "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },

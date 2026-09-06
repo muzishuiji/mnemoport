@@ -26,3 +26,5 @@ Support is keyed by product, version, operating system, and entrypoint. A capabi
 The repository test suite exercises all 16 source→target directions for Instructions, Skills, credential-free MCP definitions, and Handoff capsules through a signed package and transactional target write. Unsupported scope mappings must produce an explicit manual result. This matrix is a Core L0 smoke gate, not a claim that every conditional asset is supported in every product entrypoint.
 
 The exact fixture evidence is published as [machine-readable compatibility data](compatibility.json). Native product discovery (L1) and component execution (L2) remain separate, versioned claims; fixture success never upgrades an untested product version or GUI/remote entrypoint.
+
+The same file records the latest Linux version-level L1 observation produced by `mnemo probe`. Claude Code CLI, Codex CLI, Cursor Agent, and the Cursor IDE command launcher returned recognized versions. Qoder CLI was not installed on that host, while Qoder Desktop was detected and deliberately not executed. These observations identify exact entrypoints only; see [Product probes](product-probes.md).

@@ -194,6 +194,19 @@ mnemo recovery rollback <transaction-id> --json
 
 Recovery verifies the journal location and rollback backup hash. It refuses `manual-review` when the target matches neither recorded state, so an external edit is never guessed away.
 
+### Explicit product probe
+
+`detect` is filesystem-only. When you explicitly want version-level L1 evidence from installed products, run:
+
+```bash
+mnemo probe --json
+mnemo probe --platform cursor --json
+```
+
+The probe invokes only the adapter-owned `--version` argument, without a shell or asset-derived input. It clears credential-bearing environment variables, supplies a disposable home, captures at most 8 KiB, terminates the child after five seconds, deletes the disposable directory, and never initializes migrated Skills, MCP servers, or plugins. Results are entrypoint-specific; missing CLI, unsupported Desktop/GUI entrypoints, failures, and timeouts produce explicit statuses and exit code `2`.
+
+This is version-level L1 evidence, not proof that a particular migrated asset was discovered. The child process is not placed in an OS network namespace, so run it only for an installed executable you trust. See [Product probes](docs/product-probes.md) for the exact boundary.
+
 ### New-session Handoff capsule
 
 Handoff carries a user-reviewed task summary into a fresh session without copying a product session database. Create JSON conforming to [`handoff.schema.json`](schemas/handoff.schema.json), then package it on the source device:
@@ -211,6 +224,7 @@ On the target, use the normal `inspect` → `plan` → `trust` → `apply` flow.
 |---|---:|---|
 | `mnemo doctor [--json]` | No | Resolve MnemoPort state and detected product tuples |
 | `mnemo detect [--platform HOST] [--json]` | No | Detect one or all supported hosts without launching them |
+| `mnemo probe [--platform HOST] [--json]` | Disposable probe state only | Run bounded, version-level L1 probes for safe entrypoints |
 | `mnemo inventory --from HOST` | No | List supported assets and manual-only candidates without bodies |
 | `mnemo export --from HOST --output FILE` | No | Extract, redact/quarantine, sign, compress, and encrypt a new package |
 | `mnemo inspect FILE` | No | Decrypt, verify, and summarize a package |
@@ -266,7 +280,7 @@ Overrides select roots; they do not expand the asset allowlist. Run `mnemo docto
 - Scripts, hooks, plugins, and MCP servers are not executed during inventory, inspect, plan, or the default L0 verification.
 - `--allow-plaintext` is an explicit escape hatch for intentional non-sensitive fixtures. It should not be used for real personal assets.
 
-The alpha does not yet perform network plugin/extension installation, CLI dependency installation, OAuth/account export, MCP server execution, native auto-memory import, or broad editor-profile synchronization. It records or inventories these surfaces only when the adapter can do so safely. Public binary releases, release signing/provenance, SBOM, crash-injection coverage, and version-gated real-product L1 probes are also future hardening work; source installation and Core L0 claims do not imply those release gates are complete.
+The alpha does not yet perform network plugin/extension installation, CLI dependency installation, OAuth/account export, MCP server execution, native auto-memory import, or broad editor-profile synchronization. It records or inventories these surfaces only when the adapter can do so safely. Prepared-journal crash recovery and version-level L1 probes are implemented; asset-level native discovery, later ledger crash points, and a first public binary tag remain release gates. The repository contains SBOM/provenance automation, but those claims apply to artifacts only after their tagged workflow succeeds.
 
 ## Troubleshooting
 
@@ -292,7 +306,7 @@ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace --all-features
 ```
 
-CI runs formatting, Clippy, and the full test suite on Linux, macOS, and Windows with Rust 1.85 and Stable, plus a separate RustSec dependency audit. Fixture tests provide Core L0 evidence; they do not upgrade an untested native product version, GUI, remote, or cloud entrypoint to supported.
+CI runs formatting, Clippy, and the full test suite on Linux, macOS, and Windows with Rust 1.85 and Stable, plus RustSec and `cargo-deny` dependency-policy jobs. Fixture tests provide Core L0 evidence; they do not upgrade an untested native product version, GUI, remote, or cloud entrypoint to supported.
 
 ## Documentation
 
@@ -300,6 +314,8 @@ CI runs formatting, Clippy, and the full test suite on Linux, macOS, and Windows
 - [Compatibility and exact product boundaries](docs/compatibility.md)
 - [Machine-readable compatibility evidence](docs/compatibility.json)
 - [Package format](docs/package-format.md)
+- [Product probes and evidence boundary](docs/product-probes.md)
+- [Release and supply-chain security](docs/release-security.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
 
