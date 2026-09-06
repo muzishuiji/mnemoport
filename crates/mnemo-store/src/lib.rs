@@ -28,6 +28,16 @@ pub struct StatePaths {
 /// Resolve MnemoPort state paths without touching the filesystem.
 #[must_use]
 pub fn resolve_state_paths() -> Option<StatePaths> {
+    if let Some(root) = std::env::var_os("MNEMOPORT_STATE_ROOT").filter(|value| !value.is_empty()) {
+        let root = PathBuf::from(root);
+        return Some(StatePaths {
+            config: root.join("config"),
+            data: root.join("data"),
+            cache: root.join("cache"),
+            transactions: root.join("data/transactions"),
+        });
+    }
+
     ProjectDirs::from("io", "mnemoport", "MnemoPort").map(|dirs| StatePaths {
         config: dirs.config_dir().to_path_buf(),
         data: dirs.data_dir().to_path_buf(),

@@ -41,7 +41,7 @@ JSON commands return `0` only when the requested scope is fully complete, `2` wh
 - `mnemo-schema`: product tuples, Canonical Assets, plans, dispositions, readiness.
 - `mnemo-package`: canonical tar/zstd payload, Ed25519 signatures, age encryption.
 - `mnemo-security`: hashing, portable path policy, secret/PII scan and quarantine signals.
-- `mnemo-store`: XDG paths, device identity, SQLite ledger, backups, journals, undo.
+- `mnemo-store`: platform-native paths (or an explicit `MNEMOPORT_STATE_ROOT`), device identity, SQLite ledger, backups, journals, undo.
 - `adapters/*`: Claude Code, Codex, Qoder, and Cursor source/target behavior.
 
 ## Atomicity boundary

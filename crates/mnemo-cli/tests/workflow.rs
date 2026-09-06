@@ -426,7 +426,7 @@ fn recovery_list_is_read_only_when_no_prepared_journals_exist()
     let response = success_json(&output)?;
     assert_eq!(response["phase"], "recovery-list");
     assert_eq!(response["data"], serde_json::json!([]));
-    assert!(!state.join("data/mnemoport/transactions").exists());
+    assert!(!state.join("data/transactions").exists());
     Ok(())
 }
 
@@ -538,6 +538,7 @@ fn run(
 ) -> Result<Output, Box<dyn std::error::Error>> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mnemo"));
     command.current_dir(current_dir).args(arguments);
+    command.env("MNEMOPORT_STATE_ROOT", state_root);
     command.env("XDG_DATA_HOME", state_root.join("data"));
     command.env("XDG_CONFIG_HOME", state_root.join("config"));
     command.env("XDG_CACHE_HOME", state_root.join("cache"));

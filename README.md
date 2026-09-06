@@ -65,6 +65,8 @@ cargo uninstall mnemo-cli
 
 Uninstalling the binary does not remove migrated assets, installed host Skills, or MnemoPort's local audit/rollback state.
 
+MnemoPort normally stores its own config, ledger, cache, signing identity, and rollback journals in the operating system's native application directories. Set `MNEMOPORT_STATE_ROOT` to an absolute directory to place those files under its `config`, `data`, and `cache` subdirectories instead. This is useful for portable or isolated execution; it does not redirect any Claude Code, Codex, Qoder, or Cursor assets.
+
 ## Install the thin host Skill
 
 The CLI is the migration authority. A small host-specific Skill teaches the current AI tool how to invoke it safely. Install it for one or more hosts:
