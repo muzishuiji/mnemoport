@@ -279,6 +279,27 @@ pub fn encrypt_with_passphrase(
     Ok(encrypted)
 }
 
+/// Encrypt a complete signed package to one native age X25519 recipient.
+pub fn encrypt_with_recipient(
+    plaintext: &[u8],
+    recipient: &age::x25519::Recipient,
+) -> Result<Vec<u8>, PackageError> {
+    let encryptor =
+        age::Encryptor::with_recipients(std::iter::once(recipient as &dyn age::Recipient))
+            .map_err(|error| PackageError::Encryption(error.to_string()))?;
+    let mut encrypted = Vec::new();
+    let mut writer = encryptor
+        .wrap_output(&mut encrypted)
+        .map_err(|error| PackageError::Encryption(error.to_string()))?;
+    writer
+        .write_all(plaintext)
+        .map_err(|error| PackageError::Encryption(error.to_string()))?;
+    writer
+        .finish()
+        .map_err(|error| PackageError::Encryption(error.to_string()))?;
+    Ok(encrypted)
+}
+
 /// Decrypt an age passphrase-wrapped package with an output-size limit.
 pub fn decrypt_with_passphrase(
     encrypted: &[u8],
@@ -289,6 +310,19 @@ pub fn decrypt_with_passphrase(
     let identity = age::scrypt::Identity::new(passphrase);
     let reader = decryptor
         .decrypt(std::iter::once(&identity as &dyn age::Identity))
+        .map_err(|error| PackageError::Decryption(error.to_string()))?;
+    read_limited(reader, MAX_UNCOMPRESSED_BYTES)
+}
+
+/// Decrypt an age package with one native X25519 identity and an output-size limit.
+pub fn decrypt_with_identity(
+    encrypted: &[u8],
+    identity: &age::x25519::Identity,
+) -> Result<Vec<u8>, PackageError> {
+    let decryptor = age::Decryptor::new(Cursor::new(encrypted))
+        .map_err(|error| PackageError::Decryption(error.to_string()))?;
+    let reader = decryptor
+        .decrypt(std::iter::once(identity as &dyn age::Identity))
         .map_err(|error| PackageError::Decryption(error.to_string()))?;
     read_limited(reader, MAX_UNCOMPRESSED_BYTES)
 }
@@ -454,7 +488,10 @@ fn decode_fixed<const N: usize>(value: &str, label: &str) -> Result<[u8; N], Pac
 
 #[cfg(test)]
 mod tests {
-    use super::{PackageBuilder, PackageError, decrypt_with_passphrase, encrypt_with_passphrase};
+    use super::{
+        PackageBuilder, PackageError, decrypt_with_identity, decrypt_with_passphrase,
+        encrypt_with_passphrase, encrypt_with_recipient,
+    };
     use age::secrecy::SecretString;
     use ed25519_dalek::SigningKey;
 
@@ -514,6 +551,27 @@ mod tests {
             decrypt_with_passphrase(
                 encrypted.as_slice(),
                 SecretString::from("incorrect".to_owned())
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn age_recipient_round_trip_and_wrong_identity_rejection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, package) = fixture()?;
+        let identity = age::x25519::Identity::generate();
+        let encrypted = encrypt_with_recipient(&package.bytes, &identity.to_public())?;
+        let decrypted = decrypt_with_identity(&encrypted, &identity)?;
+        assert_eq!(decrypted, package.bytes);
+
+        let wrong_identity = age::x25519::Identity::generate();
+        assert!(decrypt_with_identity(&encrypted, &wrong_identity).is_err());
+        assert!(
+            decrypt_with_passphrase(
+                &encrypted,
+                SecretString::from("this-is-not-the-right-secret".to_owned())
             )
             .is_err()
         );

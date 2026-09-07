@@ -11,7 +11,7 @@ MnemoPort 是面向个人 AI 资产的开源可移植层。它可以在 Codex、
 
 MnemoPort 当前是可以下载预发布二进制、也可以从源码安装的 Alpha 版本。Rust CLI、签名加密包格式、事务式 Apply/Undo、四个离线 Adapter、四个轻量宿主 Skill，以及全部 16 条核心 Source→Target 冒烟路径均已实现并通过测试。原生自动记忆、账号/云端数据、插件联网安装和大范围偏好设置迁移仍有意保持为非自动操作。
 
-MnemoPort 与模型供应商无关。它不会调用 LLM API，也不需要 OpenAI、Anthropic、DeepSeek 或其他模型供应商的 API Key。它在用户已经登录的 AI 编程工具中本地运行。`MNEMOPORT_PASSPHRASE` 只是用户为 `.mnemo` 包设置的加密口令，不是模型凭据。
+MnemoPort 与模型供应商无关。它不会调用 LLM API，也不需要 OpenAI、Anthropic、DeepSeek 或其他模型供应商的 API Key。它在用户已经登录的 AI 编程工具中本地运行。资产包可以使用目标设备持有的 age 身份或用户自选的 `MNEMOPORT_PASSPHRASE` 加密；两者都不是模型凭据。
 
 ## 支持的宿主与资产
 
@@ -52,6 +52,8 @@ mnemo --version
 ```
 
 其他压缩包分别是 Apple Silicon macOS 使用的 `mnemoport-aarch64-apple-darwin.tar.gz`，以及 Windows x86-64 使用的 `mnemoport-x86_64-pc-windows-msvc.zip`。解压前先验证校验和，再把 `mnemo` 或 `mnemo.exe` 放到 `PATH` 中的目录。GitHub provenance 验证方式参见[发布安全](docs/release-security.md)。
+
+下文的 recipient 公钥加密和信任生命周期命令是在 `v0.1.0-alpha.1` 之后实现于 `main` 的功能；下一版预发布前请从源码安装。
 
 ## 从源码安装 CLI
 
@@ -160,18 +162,24 @@ L1 会为每种迁入资产输出结构化结果。当前版本可在 Linux 上�
 
 ### 跨设备或同工具迁移（X→X）
 
-在来源设备 A 上导出加密包。Qoder 只是示例，可以把来源和目标宿主标识替换成任意受支持工具：
+跨设备场景推荐使用 recipient 公钥加密：设备 A 只会收到设备 B 的公钥，不需要把共享口令传回来源设备。先在目标设备 B 上，在仓库外生成私有身份；JSON 输出中的 `recipient` 是唯一需要发给设备 A 的内容：
 
 ```bash
-export MNEMOPORT_PASSPHRASE='choose-at-least-12-characters'
-mnemo inventory --from qoder --invoked-by qoder --json
-mnemo export --from qoder --invoked-by qoder --output qoder-assets.mnemo --json
+mnemo recipient generate --output "$HOME/.config/mnemoport/device-b.agekey" --json
+export MNEMOPORT_IDENTITY_FILE="$HOME/.config/mnemoport/device-b.agekey"
+mnemo recipient show --json
 ```
 
-仅通过你信任的渠道传输 `qoder-assets.mnemo`。在目标设备 B 上，通过 shell 或 Secret Manager 设置相同口令：
+请私密保存并备份 `.agekey` 文件。MnemoPort 不会覆盖已有文件，并会在操作系统支持时设置仅当前用户可读写的权限。把 `age1...` recipient 发给来源设备 A。Qoder 只是示例，可以把来源和目标宿主标识替换成任意受支持工具：
 
 ```bash
-export MNEMOPORT_PASSPHRASE='choose-at-least-12-characters'
+mnemo inventory --from qoder --invoked-by qoder --json
+mnemo export --from qoder --invoked-by qoder --output qoder-assets.mnemo --recipient 'age1...' --json
+```
+
+把 `qoder-assets.mnemo` 传到目标设备 B。在该设备继续保留 `MNEMOPORT_IDENTITY_FILE` 后，执行标准目标流程：
+
+```bash
 mnemo inspect qoder-assets.mnemo --json
 mnemo plan --input qoder-assets.mnemo --to qoder --invoked-by qoder --output migration-plan.json --json
 mnemo trust add --input qoder-assets.mnemo --label device-a --json
@@ -185,6 +193,25 @@ mnemo verify --input qoder-assets.mnemo --plan migration-plan.json --json
 ```
 
 把 `--to qoder` 改成其他受支持宿主，即可执行跨设备 X→Y 迁移。版本化 Adapter 合同确认安全时，X→X 会保留精确的原生位置；但它仍不会复制认证信息、会话、缓存或未公开数据库。
+
+也可以不传 `--recipient`，改为在两台设备上设置相同的 12 字符以上 `MNEMOPORT_PASSPHRASE`。口令不会保存在包中。recipient 模式与明文模式互斥。
+
+### 签名信任生命周期
+
+签名信任只保存在目标设备本地，并且与包加密相互独立。执行 `trust add` 前，应通过可信渠道核对新来源设备的指纹。来源设备退役或丢失后，使用完整精确指纹撤销信任；命令拒绝指纹前缀：
+
+```bash
+mnemo trust list --json
+mnemo trust revoke sha256:<64位小写十六进制> --json
+```
+
+对于计划内的设备签名密钥轮换，先取得并检查由替代设备签名的包，再原子地信任新签名者并撤销旧签名者：
+
+```bash
+mnemo trust rotate --from sha256:<旧的64位小写十六进制> --input replacement.mnemo --label device-a-new --json
+```
+
+轮换只改变签名信任，不会轮换或暴露目标设备的 age 解密身份。
 
 ### Windows PowerShell 口令
 
@@ -244,7 +271,7 @@ export MNEMOPORT_PASSPHRASE='choose-at-least-12-characters'
 mnemo handoff --input handoff.json --output handoff.mnemo --json
 ```
 
-在目标设备上继续使用正常的 `inspect` → `plan` → `trust` → `apply` 流程。目标项目会收到一个 Markdown sidecar；不会注入内部会话 ID、聊天数据库或认证状态。
+使用 recipient 加密时，把环境变量替换为 `--recipient 'age1...'`，并在目标设备选择相应 identity。然后继续使用正常的 `inspect` → `plan` → `trust` → `apply` 流程。目标项目会收到一个 Markdown sidecar；不会注入内部会话 ID、聊天数据库或认证状态。
 
 ## 命令参考
 
@@ -259,6 +286,10 @@ mnemo handoff --input handoff.json --output handoff.mnemo --json
 | `mnemo plan --input FILE --to HOST --output PLAN` | 否 | 针对当前目标生成新的不可变计划 |
 | `mnemo trust add --input FILE` | 仅 MnemoPort 状态 | 信任一个已验证的来源设备签名身份 |
 | `mnemo trust list` | 否 | 列出本机信任的签名指纹 |
+| `mnemo trust revoke FINGERPRINT` | 仅 MnemoPort 状态 | 精确撤销一个完整签名指纹 |
+| `mnemo trust rotate --from FINGERPRINT --input FILE` | 仅 MnemoPort 状态 | 原子地信任替代包签名者并撤销旧签名者 |
+| `mnemo recipient generate --output FILE` | 仅 MnemoPort 身份文件 | 创建目标设备持有的 age 身份并返回公有 recipient |
+| `mnemo recipient show [--identity FILE]` | 否 | 在不暴露私有身份的情况下推导公有 recipient |
 | `mnemo apply --input FILE --plan PLAN --approve TOKEN` | 是 | 重新验证并以事务方式写入已批准的目标文件 |
 | `mnemo verify --input FILE --plan PLAN [--level l0\|l1]` | 仅一次性 L1 探测状态 | 比较目标哈希，并可请求精确 tuple 的原生资产发现 |
 | `mnemo report ID` | 否 | 读取操作状态和日志数量 |
@@ -266,7 +297,7 @@ mnemo handoff --input handoff.json --output handoff.mnemo --json
 | `mnemo recovery list` | 否 | 对中断后遗留的 prepared 日志进行分类 |
 | `mnemo recovery rollback TRANSACTION_ID` | 是 | 安全关闭或恢复一个无歧义的 prepared 事务 |
 | `mnemo integration install/status/uninstall` | 仅宿主 Skill | 通过所有权检查管理轻量集成 |
-| `mnemo handoff --input JSON --output FILE` | 否 | 打包用户选定的新会话交接信息 |
+| `mnemo handoff --input JSON --output FILE [--recipient AGE_RECIPIENT]` | 否 | 打包用户选定的新会话交接信息 |
 
 使用 `mnemo <command> --help` 查看全部参数。添加 `--json` 可输出供 Skills 和脚本使用的稳定响应封装。
 
@@ -313,7 +344,7 @@ MnemoPort 只读取 Adapter 批准的路径以及当前 workspace。隔离测试
 ## 故障排查
 
 - **`mnemo: command not found`：** 把 Cargo 的二进制目录加入 `PATH`，然后重新打开终端。
-- **加密包要求口令：** 在来源和目标上把 `MNEMOPORT_PASSPHRASE` 设置为同一个至少 12 字符的值。该值不会保存在包内。
+- **无法打开加密包：** recipient 加密需要在目标设备传入 `--identity <路径>` 或设置 `MNEMOPORT_IDENTITY_FILE`；口令加密则需要在两台设备上设置相同的 12 字符以上 `MNEMOPORT_PASSPHRASE`。
 - **退出码 2：** 检查 `skipped_assets` 和手动操作。安全子集已完成，但完整请求范围尚未完成。
 - **签名者不受信任：** 运行 `inspect`，通过可信渠道核对显示的指纹，再运行 `mnemo trust add --input <package>`。
 - **计划漂移或批准不匹配：** 丢弃当前计划，选择新的计划输出文件名，并针对当前目标重新运行 `plan`。

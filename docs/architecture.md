@@ -16,7 +16,7 @@ The Rust core owns deterministic schemas, path and content policy, package verif
 
 1. `doctor` resolves platform tuples without creating product directories.
 2. `inventory` reports supported and inventory-only assets without asset bodies.
-3. `export` extracts supported assets, removes credential values, signs, compresses, and encrypts one `.mnemo` file.
+3. `export` extracts supported assets, removes credential values, signs, compresses, and encrypts one `.mnemo` file to a destination recipient or passphrase.
 4. `inspect` decrypts and verifies the package without target writes.
 5. `plan` renders against the exact target tuple and snapshots current target hashes.
 6. `apply` rebuilds the plan, rejects drift, then commits local files with journals and backups; its ledger transaction and managed-object ownership update are atomic.
@@ -30,7 +30,7 @@ Product discovery is also split by effect. `detect` only resolves files and exec
 
 For same-tool moves between devices, `handoff` packages a user-selected new-session capsule using the same signing and encryption path. The destination receives a Markdown sidecar; MnemoPort never injects a private session database.
 
-Plans are target-device artifacts. A cross-device package is created on source device A, while the plan is created on target device B so its preconditions describe the actual destination.
+Plans are target-device artifacts. A cross-device package is created on source device A, while the plan is created on target device B so its preconditions describe the actual destination. For recipient encryption, B generates the private age identity and gives A only the public recipient. Signing trust remains a separate explicit destination decision and supports exact-fingerprint revocation and atomic signer rotation.
 
 JSON commands return `0` only when the requested scope is fully complete, `2` when the safe portion completed with manual/conditional work, `3` for conflicts or target drift, `4` for a safety refusal, `5` for unavailable dependency/trust state, `6` for incompatible input, and `70` for an internal failure.
 

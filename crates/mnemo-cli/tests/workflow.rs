@@ -18,6 +18,219 @@ fn help_and_version_are_successful_control_flow() -> Result<(), Box<dyn std::err
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn recipient_encryption_and_signer_trust_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let source_state = temp.path().join("source-state");
+    let replacement_state = temp.path().join("replacement-state");
+    let target_state = temp.path().join("target-state");
+    let target_config = temp.path().join("target-codex");
+    std::fs::create_dir_all(&workspace)?;
+    std::fs::create_dir_all(&target_config)?;
+    std::fs::write(workspace.join("AGENTS.md"), "Keep migrations reversible.\n")?;
+
+    let identity = temp.path().join("target.agekey");
+    let generated_output = run(
+        &workspace,
+        &target_state,
+        &[
+            "recipient",
+            "generate",
+            "--output",
+            identity.to_str().ok_or("identity path is not UTF-8")?,
+            "--json",
+        ],
+        &[],
+    )?;
+    assert!(!String::from_utf8_lossy(&generated_output.stdout).contains("AGE-SECRET-KEY-"));
+    let generated = success_json(&generated_output)?;
+    let recipient = generated["data"]["recipient"]
+        .as_str()
+        .ok_or("recipient missing")?;
+    assert!(recipient.starts_with("age1"));
+    let identity_body = std::fs::read_to_string(&identity)?;
+    assert!(identity_body.contains("AGE-SECRET-KEY-"));
+    assert!(
+        !String::from_utf8_lossy(
+            &run(
+                &workspace,
+                &target_state,
+                &[
+                    "recipient",
+                    "show",
+                    "--identity",
+                    identity.to_str().ok_or("identity path is not UTF-8")?,
+                    "--json",
+                ],
+                &[],
+            )?
+            .stdout
+        )
+        .contains("AGE-SECRET-KEY-")
+    );
+
+    let package = temp.path().join("recipient.mnemo");
+    let exported = success_json(&run(
+        &workspace,
+        &source_state,
+        &[
+            "export",
+            "--from",
+            "codex",
+            "--output",
+            package.to_str().ok_or("package path is not UTF-8")?,
+            "--recipient",
+            recipient,
+            "--json",
+        ],
+        &[("CODEX_HOME", &target_config)],
+    )?)?;
+    assert_eq!(exported["data"]["encryption"], "age-x25519");
+    let encrypted_bytes = std::fs::read(&package)?;
+    assert!(
+        !encrypted_bytes
+            .windows(b"AGE-SECRET-KEY-".len())
+            .any(|window| window == b"AGE-SECRET-KEY-")
+    );
+
+    let wrong_identity = temp.path().join("wrong.agekey");
+    success_json(&run(
+        &workspace,
+        &target_state,
+        &[
+            "recipient",
+            "generate",
+            "--output",
+            wrong_identity
+                .to_str()
+                .ok_or("identity path is not UTF-8")?,
+            "--json",
+        ],
+        &[],
+    )?)?;
+    let rejected = run(
+        &workspace,
+        &target_state,
+        &[
+            "inspect",
+            package.to_str().ok_or("package path is not UTF-8")?,
+            "--identity",
+            wrong_identity
+                .to_str()
+                .ok_or("identity path is not UTF-8")?,
+            "--json",
+        ],
+        &[],
+    )?;
+    assert_eq!(rejected.status.code(), Some(6));
+
+    let inspected = success_json(&run(
+        &workspace,
+        &target_state,
+        &[
+            "inspect",
+            package.to_str().ok_or("package path is not UTF-8")?,
+            "--identity",
+            identity.to_str().ok_or("identity path is not UTF-8")?,
+            "--json",
+        ],
+        &[],
+    )?)?;
+    assert_eq!(inspected["data"]["encrypted"], true);
+    let trusted = success_json(&run(
+        &workspace,
+        &target_state,
+        &[
+            "trust",
+            "add",
+            "--input",
+            package.to_str().ok_or("package path is not UTF-8")?,
+            "--identity",
+            identity.to_str().ok_or("identity path is not UTF-8")?,
+            "--label",
+            "old device",
+            "--json",
+        ],
+        &[],
+    )?)?;
+    let old_fingerprint = trusted["data"]["fingerprint"]
+        .as_str()
+        .ok_or("old fingerprint missing")?;
+    let ambiguous_revoke = run(
+        &workspace,
+        &target_state,
+        &["trust", "revoke", &old_fingerprint[..24], "--json"],
+        &[],
+    )?;
+    assert_eq!(ambiguous_revoke.status.code(), Some(6));
+
+    let replacement_package = temp.path().join("replacement.mnemo");
+    success_json(&run(
+        &workspace,
+        &replacement_state,
+        &[
+            "export",
+            "--from",
+            "codex",
+            "--output",
+            replacement_package
+                .to_str()
+                .ok_or("replacement package path is not UTF-8")?,
+            "--allow-plaintext",
+            "--json",
+        ],
+        &[("CODEX_HOME", &target_config)],
+    )?)?;
+    let rotated = success_json(&run(
+        &workspace,
+        &target_state,
+        &[
+            "trust",
+            "rotate",
+            "--from",
+            old_fingerprint,
+            "--input",
+            replacement_package
+                .to_str()
+                .ok_or("replacement package path is not UTF-8")?,
+            "--label",
+            "new device",
+            "--json",
+        ],
+        &[],
+    )?)?;
+    assert_eq!(rotated["data"]["revoked"]["fingerprint"], old_fingerprint);
+    let replacement_fingerprint = rotated["data"]["trusted"]["fingerprint"]
+        .as_str()
+        .ok_or("replacement fingerprint missing")?;
+    assert_ne!(replacement_fingerprint, old_fingerprint);
+
+    let revoked = success_json(&run(
+        &workspace,
+        &target_state,
+        &["trust", "revoke", replacement_fingerprint, "--json"],
+        &[],
+    )?)?;
+    assert_eq!(revoked["data"]["fingerprint"], replacement_fingerprint);
+    let trust_list = success_json(&run(
+        &workspace,
+        &target_state,
+        &["trust", "list", "--json"],
+        &[],
+    )?)?;
+    assert_eq!(trust_list["data"].as_array().map(Vec::len), Some(0));
+    let missing_revoke = run(
+        &workspace,
+        &target_state,
+        &["trust", "revoke", replacement_fingerprint, "--json"],
+        &[],
+    )?;
+    assert_eq!(missing_revoke.status.code(), Some(5));
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn encrypted_cross_device_export_plan_apply_and_undo() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let source_workspace = temp.path().join("source-workspace");

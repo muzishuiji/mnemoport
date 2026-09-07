@@ -459,14 +459,21 @@ impl Ledger {
             "INSERT INTO trusted_keys(fingerprint, public_key, label, trusted_at_ms)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(fingerprint) DO UPDATE SET label = excluded.label",
-            params![fingerprint, public_key, label, trusted_at_ms],
+            params![&fingerprint, public_key, label, trusted_at_ms],
         )?;
-        Ok(TrustedKeyRecord {
-            fingerprint,
-            public_key: public_key.to_owned(),
-            label: label.map(ToOwned::to_owned),
-            trusted_at_ms,
-        })
+        Ok(self.connection.query_row(
+            "SELECT fingerprint, public_key, label, trusted_at_ms
+             FROM trusted_keys WHERE fingerprint = ?1",
+            [&fingerprint],
+            |row| {
+                Ok(TrustedKeyRecord {
+                    fingerprint: row.get(0)?,
+                    public_key: row.get(1)?,
+                    label: row.get(2)?,
+                    trusted_at_ms: row.get(3)?,
+                })
+            },
+        )?)
     }
 
     /// Return whether a signer was explicitly trusted.
@@ -498,6 +505,103 @@ impl Ledger {
             })
         })?;
         rows.map(|row| row.map_err(StoreError::from)).collect()
+    }
+
+    /// Revoke exactly one trusted signing identity by its full fingerprint.
+    pub fn revoke_trusted_key(&self, fingerprint: &str) -> Result<TrustedKeyRecord, StoreError> {
+        let record = self
+            .connection
+            .query_row(
+                "SELECT fingerprint, public_key, label, trusted_at_ms
+                 FROM trusted_keys WHERE fingerprint = ?1",
+                [fingerprint],
+                |row| {
+                    Ok(TrustedKeyRecord {
+                        fingerprint: row.get(0)?,
+                        public_key: row.get(1)?,
+                        label: row.get(2)?,
+                        trusted_at_ms: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("trusted key {fingerprint}")))?;
+        self.connection.execute(
+            "DELETE FROM trusted_keys WHERE fingerprint = ?1",
+            [fingerprint],
+        )?;
+        Ok(record)
+    }
+
+    /// Atomically trust a replacement signer and revoke the old signer.
+    pub fn rotate_trusted_key(
+        &self,
+        old_fingerprint: &str,
+        replacement_public_key: &str,
+        replacement_label: Option<&str>,
+    ) -> Result<(TrustedKeyRecord, TrustedKeyRecord), StoreError> {
+        let replacement_fingerprint = sha256_id(replacement_public_key.as_bytes());
+        if replacement_fingerprint == old_fingerprint {
+            return Err(StoreError::InvalidState(
+                "replacement signer is identical to the signer being rotated".to_owned(),
+            ));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let old = transaction
+            .query_row(
+                "SELECT fingerprint, public_key, label, trusted_at_ms
+                 FROM trusted_keys WHERE fingerprint = ?1",
+                [old_fingerprint],
+                |row| {
+                    Ok(TrustedKeyRecord {
+                        fingerprint: row.get(0)?,
+                        public_key: row.get(1)?,
+                        label: row.get(2)?,
+                        trusted_at_ms: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("trusted key {old_fingerprint}")))?;
+        if transaction
+            .query_row(
+                "SELECT 1 FROM trusted_keys WHERE fingerprint = ?1",
+                [&replacement_fingerprint],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(StoreError::InvalidState(
+                "replacement signer is already trusted; revoke the old signer explicitly"
+                    .to_owned(),
+            ));
+        }
+        let trusted_at_ms = unix_millis()?;
+        transaction.execute(
+            "INSERT INTO trusted_keys(fingerprint, public_key, label, trusted_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                replacement_fingerprint,
+                replacement_public_key,
+                replacement_label,
+                trusted_at_ms
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM trusted_keys WHERE fingerprint = ?1",
+            [old_fingerprint],
+        )?;
+        transaction.commit()?;
+        Ok((
+            old,
+            TrustedKeyRecord {
+                fingerprint: replacement_fingerprint,
+                public_key: replacement_public_key.to_owned(),
+                label: replacement_label.map(ToOwned::to_owned),
+                trusted_at_ms,
+            },
+        ))
     }
 }
 
@@ -1744,6 +1848,46 @@ mod tests {
             std::fs::read(temp.path().join("device-signing-key.bin"))?.len(),
             32
         );
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_key_revoke_and_rotation_are_exact_and_atomic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let ledger = Ledger::open(&temp.path().join("ledger.sqlite"))?;
+        let old = ledger.trust_key("old-public-key", Some("old device"))?;
+        let unrelated = ledger.trust_key("unrelated-public-key", Some("other device"))?;
+        let relabeled = ledger.trust_key("old-public-key", Some("old device relabeled"))?;
+        assert_eq!(relabeled.trusted_at_ms, old.trusted_at_ms);
+        assert_eq!(relabeled.label.as_deref(), Some("old device relabeled"));
+
+        let (removed, replacement) = ledger.rotate_trusted_key(
+            &old.fingerprint,
+            "replacement-public-key",
+            Some("new device"),
+        )?;
+        assert_eq!(removed, relabeled);
+        assert!(!ledger.is_key_trusted("old-public-key")?);
+        assert!(ledger.is_key_trusted("replacement-public-key")?);
+        assert!(ledger.is_key_trusted("unrelated-public-key")?);
+        assert_eq!(replacement.label.as_deref(), Some("new device"));
+
+        let missing = ledger.rotate_trusted_key(
+            &old.fingerprint,
+            "never-inserted-public-key",
+            Some("must not be written"),
+        );
+        assert!(matches!(missing, Err(StoreError::NotFound(_))));
+        assert!(!ledger.is_key_trusted("never-inserted-public-key")?);
+
+        let revoked = ledger.revoke_trusted_key(&unrelated.fingerprint)?;
+        assert_eq!(revoked, unrelated);
+        assert!(!ledger.is_key_trusted("unrelated-public-key")?);
+        assert!(matches!(
+            ledger.revoke_trusted_key(&unrelated.fingerprint),
+            Err(StoreError::NotFound(_))
+        ));
         Ok(())
     }
 }

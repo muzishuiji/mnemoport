@@ -1,6 +1,6 @@
 //! MnemoPort command-line interface.
 
-use age::secrecy::SecretString;
+use age::secrecy::{ExposeSecret, SecretString};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use mnemo_adapter_common::CollectionMode;
@@ -19,6 +19,10 @@ use std::process::ExitCode;
 #[derive(Debug, Parser)]
 #[command(name = "mnemo", version, about = "Portable AI assets, safely")]
 struct Cli {
+    /// Native age identity file used to decrypt recipient-encrypted packages.
+    /// Defaults to MNEMOPORT_IDENTITY_FILE when that variable is set.
+    #[arg(long, global = true, value_name = "PATH")]
+    identity: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -73,8 +77,11 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
         /// Explicitly permit an unencrypted signed package.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "recipient")]
         allow_plaintext: bool,
+        /// Native age X25519 recipient for destination-only decryption.
+        #[arg(long, value_name = "AGE_RECIPIENT")]
+        recipient: Option<String>,
         /// Emit the stable JSON response envelope.
         #[arg(long)]
         json: bool,
@@ -172,6 +179,12 @@ enum Command {
         #[command(subcommand)]
         action: TrustAction,
     },
+    /// Generate or inspect an age identity for cross-device package encryption.
+    Recipient {
+        /// Recipient identity action.
+        #[command(subcommand)]
+        action: RecipientAction,
+    },
     /// Package a user-selected new-session Handoff capsule.
     Handoff {
         /// JSON file matching the Handoff schema; never an internal session DB.
@@ -181,8 +194,11 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
         /// Explicitly allow an unencrypted non-sensitive fixture.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "recipient")]
         allow_plaintext: bool,
+        /// Native age X25519 recipient for destination-only decryption.
+        #[arg(long, value_name = "AGE_RECIPIENT")]
+        recipient: Option<String>,
         /// Emit the stable JSON response envelope.
         #[arg(long)]
         json: bool,
@@ -223,6 +239,48 @@ enum TrustAction {
     },
     /// List trusted signer fingerprints and public keys.
     List {
+        /// Emit the stable JSON response envelope.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke one signer by its exact full fingerprint.
+    Revoke {
+        /// Full fingerprint returned by `mnemo trust list`.
+        fingerprint: String,
+        /// Emit the stable JSON response envelope.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Atomically trust a package signer and revoke one old signer.
+    Rotate {
+        /// Full fingerprint of the currently trusted signer to revoke.
+        #[arg(long = "from")]
+        from_fingerprint: String,
+        /// Package signed by the replacement identity.
+        #[arg(long)]
+        input: PathBuf,
+        /// Optional human label for the replacement device.
+        #[arg(long)]
+        label: Option<String>,
+        /// Emit the stable JSON response envelope.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RecipientAction {
+    /// Generate a new native age identity without overwriting an existing file.
+    Generate {
+        /// New private identity file path.
+        #[arg(long)]
+        output: PathBuf,
+        /// Emit the stable JSON response envelope.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the public recipient for the selected private identity.
+    Show {
         /// Emit the stable JSON response envelope.
         #[arg(long)]
         json: bool,
@@ -288,7 +346,20 @@ struct ExportReport {
     assets: usize,
     quarantined_assets: usize,
     encrypted: bool,
+    encryption: &'static str,
     signer_fingerprint: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RecipientReport {
+    identity_path: PathBuf,
+    recipient: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TrustRotationReport {
+    revoked: mnemo_store::TrustedKeyRecord,
+    trusted: mnemo_store::TrustedKeyRecord,
 }
 
 #[derive(Debug, Serialize)]
@@ -402,7 +473,8 @@ fn main() -> ExitCode {
 #[allow(clippy::too_many_lines)]
 fn run(cli: Cli) -> Result<u8> {
     let mut outcome = 0_u8;
-    match cli.command {
+    let Cli { identity, command } = cli;
+    match command {
         Command::Doctor { json } => {
             let report = mnemo_core::doctor().context("doctor failed")?;
             emit(json, "doctor", report)?;
@@ -438,9 +510,9 @@ fn run(cli: Cli) -> Result<u8> {
             invoked_by: _,
             output,
             allow_plaintext,
+            recipient,
             json,
         } => {
-            let should_encrypt = !allow_plaintext;
             let assets = mnemo_core::extract(from, CollectionMode::OfflineStatic)
                 .context("asset extraction failed")?;
             let quarantined_assets = assets
@@ -454,19 +526,16 @@ fn run(cli: Cli) -> Result<u8> {
             let key = mnemo_store::load_or_create_signing_key(&state.data)
                 .context("device signing identity unavailable")?;
             let package = mnemo_core::package_assets(&assets, &key)?;
-            let bytes = if should_encrypt {
-                let passphrase = passphrase_from_environment()?;
-                mnemo_package::encrypt_with_passphrase(&package.bytes, &passphrase)?
-            } else {
-                package.bytes.clone()
-            };
+            let (bytes, encryption) =
+                seal_package(&package.bytes, allow_plaintext, recipient.as_deref())?;
             write_new_private(&output, &bytes)?;
             let report = ExportReport {
                 output,
                 package_id: package.manifest.package_id,
                 assets: assets.len(),
                 quarantined_assets,
-                encrypted: should_encrypt,
+                encrypted: encryption != "plaintext",
+                encryption,
                 signer_fingerprint: mnemo_core::signer_fingerprint(
                     &package.manifest.signer_public_key,
                 ),
@@ -474,7 +543,7 @@ fn run(cli: Cli) -> Result<u8> {
             emit(json, "export", report)?;
         }
         Command::Inspect { input, json } => {
-            let (verified, encrypted) = open_package(&input)?;
+            let (verified, encrypted) = open_package(&input, identity.as_deref())?;
             let assets = mnemo_core::unpack_assets(&verified)?;
             let report = InspectReport {
                 package_id: verified.manifest.package_id.clone(),
@@ -496,7 +565,7 @@ fn run(cli: Cli) -> Result<u8> {
             json,
         } => {
             validate_target_host(invoked_by, to)?;
-            let (verified, _) = open_package(&input)?;
+            let (verified, _) = open_package(&input, identity.as_deref())?;
             let assets = mnemo_core::unpack_assets(&verified)?;
             let workspace = std::env::current_dir()?;
             let (target, roots) = mnemo_core::resolve_target_roots(to, &workspace)?;
@@ -539,7 +608,7 @@ fn run(cli: Cli) -> Result<u8> {
                 anyhow::bail!("approval token does not match this plan");
             }
             validate_target_host(invoked_by, saved.target.platform)?;
-            let (verified, _) = open_package(&input)?;
+            let (verified, _) = open_package(&input, identity.as_deref())?;
             require_trusted_signer(&verified.manifest.signer_public_key)?;
             let assets = mnemo_core::unpack_assets(&verified)?;
             let workspace = std::env::current_dir()?;
@@ -563,7 +632,7 @@ fn run(cli: Cli) -> Result<u8> {
             level,
             json,
         } => {
-            let report = verify_migration(&input, &plan, level)?;
+            let report = verify_migration(&input, &plan, level, identity.as_deref())?;
             if report.skipped_assets > 0
                 || report
                     .asset_discovery
@@ -621,7 +690,7 @@ fn run(cli: Cli) -> Result<u8> {
         },
         Command::Trust { action } => match action {
             TrustAction::Add { input, label, json } => {
-                let (verified, _) = open_package(&input)?;
+                let (verified, _) = open_package(&input, identity.as_deref())?;
                 let state =
                     mnemo_store::resolve_state_paths().context("state paths unavailable")?;
                 let ledger = Ledger::open(&state.data.join("ledger.sqlite"))?;
@@ -635,11 +704,75 @@ fn run(cli: Cli) -> Result<u8> {
                 let ledger = Ledger::open(&state.data.join("ledger.sqlite"))?;
                 emit(json, "trust-list", ledger.trusted_keys()?)?;
             }
+            TrustAction::Revoke { fingerprint, json } => {
+                validate_full_fingerprint(&fingerprint)?;
+                let state =
+                    mnemo_store::resolve_state_paths().context("state paths unavailable")?;
+                let ledger = Ledger::open(&state.data.join("ledger.sqlite"))?;
+                emit(
+                    json,
+                    "trust-revoke",
+                    ledger.revoke_trusted_key(&fingerprint)?,
+                )?;
+            }
+            TrustAction::Rotate {
+                from_fingerprint,
+                input,
+                label,
+                json,
+            } => {
+                validate_full_fingerprint(&from_fingerprint)?;
+                let (verified, _) = open_package(&input, identity.as_deref())?;
+                let state =
+                    mnemo_store::resolve_state_paths().context("state paths unavailable")?;
+                let ledger = Ledger::open(&state.data.join("ledger.sqlite"))?;
+                let (revoked, trusted) = ledger.rotate_trusted_key(
+                    &from_fingerprint,
+                    &verified.manifest.signer_public_key,
+                    label.as_deref(),
+                )?;
+                emit(
+                    json,
+                    "trust-rotate",
+                    TrustRotationReport { revoked, trusted },
+                )?;
+            }
+        },
+        Command::Recipient { action } => match action {
+            RecipientAction::Generate { output, json } => {
+                let generated = age::x25519::Identity::generate();
+                let recipient = generated.to_public().to_string();
+                let body = format!(
+                    "# MnemoPort native age identity. Keep this file secret.\n# public key: {recipient}\n{}\n",
+                    generated.to_string().expose_secret()
+                );
+                write_new_private(&output, body.as_bytes())?;
+                emit(
+                    json,
+                    "recipient-generate",
+                    RecipientReport {
+                        identity_path: output,
+                        recipient,
+                    },
+                )?;
+            }
+            RecipientAction::Show { json } => {
+                let (identity_path, loaded) = load_selected_identity(identity.as_deref())?;
+                emit(
+                    json,
+                    "recipient-show",
+                    RecipientReport {
+                        identity_path,
+                        recipient: loaded.to_public().to_string(),
+                    },
+                )?;
+            }
         },
         Command::Handoff {
             input,
             output,
             allow_plaintext,
+            recipient,
             json,
         } => {
             let capsule: mnemo_schema::HandoffCapsule = serde_json::from_slice(
@@ -651,14 +784,8 @@ fn run(cli: Cli) -> Result<u8> {
             let state = mnemo_store::resolve_state_paths().context("state paths unavailable")?;
             let key = mnemo_store::load_or_create_signing_key(&state.data)?;
             let package = mnemo_core::package_assets(&[asset], &key)?;
-            let bytes = if allow_plaintext {
-                package.bytes.clone()
-            } else {
-                mnemo_package::encrypt_with_passphrase(
-                    &package.bytes,
-                    &passphrase_from_environment()?,
-                )?
-            };
+            let (bytes, encryption) =
+                seal_package(&package.bytes, allow_plaintext, recipient.as_deref())?;
             write_new_private(&output, &bytes)?;
             emit(
                 json,
@@ -668,7 +795,8 @@ fn run(cli: Cli) -> Result<u8> {
                     package_id: package.manifest.package_id,
                     assets: 1,
                     quarantined_assets: 0,
-                    encrypted: !allow_plaintext,
+                    encrypted: encryption != "plaintext",
+                    encryption,
                     signer_fingerprint: mnemo_core::signer_fingerprint(
                         &package.manifest.signer_public_key,
                     ),
@@ -695,11 +823,17 @@ fn command_phase(command: &Command) -> &'static str {
         Command::Recovery { .. } => "recovery",
         Command::Integration { .. } => "integration",
         Command::Trust { .. } => "trust",
+        Command::Recipient { .. } => "recipient",
         Command::Handoff { .. } => "handoff",
     }
 }
 
-fn verify_migration(input: &Path, plan: &Path, level: VerifyLevel) -> Result<VerifyReport> {
+fn verify_migration(
+    input: &Path,
+    plan: &Path,
+    level: VerifyLevel,
+    identity_path: Option<&Path>,
+) -> Result<VerifyReport> {
     let saved: MigrationPlan = serde_json::from_slice(
         &fs::read(plan).with_context(|| format!("cannot read {}", plan.display()))?,
     )
@@ -710,7 +844,7 @@ fn verify_migration(input: &Path, plan: &Path, level: VerifyLevel) -> Result<Ver
     if expected_plan_id != saved.plan_id {
         anyhow::bail!("invalid migration plan identity");
     }
-    let (verified, _) = open_package(input)?;
+    let (verified, _) = open_package(input, identity_path)?;
     let assets = mnemo_core::unpack_assets(&verified)?;
     let workspace = std::env::current_dir()?;
     let (target, roots) = mnemo_core::resolve_target_roots(saved.target.platform, &workspace)?;
@@ -856,6 +990,7 @@ fn classify_error(error: &anyhow::Error) -> (u8, &'static str) {
     {
         (4, "safety_policy_refused")
     } else if message.contains("not trusted")
+        || message.contains("not found: trusted key")
         || message.contains("state paths unavailable")
         || message.contains("dependency")
         || message.contains("unavailable")
@@ -869,6 +1004,7 @@ fn classify_error(error: &anyhow::Error) -> (u8, &'static str) {
         || message.contains("verification")
         || message.contains("package")
         || message.contains("schema")
+        || message.contains("fingerprint")
     {
         (6, "invalid_or_unsupported_input")
     } else {
@@ -1215,7 +1351,68 @@ fn passphrase_from_environment() -> Result<SecretString> {
     Ok(SecretString::from(passphrase))
 }
 
-fn open_package(path: &Path) -> Result<(mnemo_package::VerifiedPackage, bool)> {
+fn seal_package(
+    plaintext: &[u8],
+    allow_plaintext: bool,
+    recipient: Option<&str>,
+) -> Result<(Vec<u8>, &'static str)> {
+    if allow_plaintext {
+        return Ok((plaintext.to_vec(), "plaintext"));
+    }
+    if let Some(recipient) = recipient {
+        let parsed = recipient
+            .parse::<age::x25519::Recipient>()
+            .map_err(|error| anyhow::anyhow!("invalid native age recipient: {error}"))?;
+        return Ok((
+            mnemo_package::encrypt_with_recipient(plaintext, &parsed)?,
+            "age-x25519",
+        ));
+    }
+    Ok((
+        mnemo_package::encrypt_with_passphrase(plaintext, &passphrase_from_environment()?)?,
+        "age-scrypt",
+    ))
+}
+
+fn selected_identity_path(explicit: Option<&Path>) -> Result<Option<PathBuf>> {
+    if let Some(path) = explicit {
+        return Ok(Some(path.to_path_buf()));
+    }
+    match std::env::var("MNEMOPORT_IDENTITY_FILE") {
+        Ok(path) if !path.is_empty() => Ok(Some(PathBuf::from(path))),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("MNEMOPORT_IDENTITY_FILE is not valid Unicode")
+        }
+    }
+}
+
+fn load_selected_identity(explicit: Option<&Path>) -> Result<(PathBuf, age::x25519::Identity)> {
+    let path = selected_identity_path(explicit)?.context(
+        "recipient identity is unavailable; pass --identity <path> or set MNEMOPORT_IDENTITY_FILE",
+    )?;
+    let body = fs::read_to_string(&path)
+        .with_context(|| format!("cannot read recipient identity file {}", path.display()))?;
+    let mut secret_lines = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let secret = secret_lines
+        .next()
+        .context("recipient identity file contains no native age identity")?;
+    if secret_lines.next().is_some() {
+        anyhow::bail!("recipient identity file must contain exactly one native age identity");
+    }
+    let identity = secret
+        .parse::<age::x25519::Identity>()
+        .map_err(|error| anyhow::anyhow!("invalid native age identity: {error}"))?;
+    Ok((path, identity))
+}
+
+fn open_package(
+    path: &Path,
+    identity_path: Option<&Path>,
+) -> Result<(mnemo_package::VerifiedPackage, bool)> {
     let bytes = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
     match mnemo_package::verify(&bytes) {
         Ok(package) => return Ok((package, false)),
@@ -1224,14 +1421,45 @@ fn open_package(path: &Path) -> Result<(mnemo_package::VerifiedPackage, bool)> {
         }
         Err(_) => {}
     }
-    let passphrase = passphrase_from_environment()
-        .context("package is not plaintext; encrypted inspection needs the passphrase")?;
-    let decrypted = mnemo_package::decrypt_with_passphrase(&bytes, passphrase)
-        .context("package decryption failed")?;
-    Ok((
-        mnemo_package::verify(&decrypted).context("decrypted package verification failed")?,
-        true,
-    ))
+
+    if selected_identity_path(identity_path)?.is_some() {
+        let (_, identity) = load_selected_identity(identity_path)?;
+        if let Ok(decrypted) = mnemo_package::decrypt_with_identity(&bytes, &identity) {
+            return Ok((
+                mnemo_package::verify(&decrypted)
+                    .context("decrypted package verification failed")?,
+                true,
+            ));
+        }
+    }
+    if std::env::var_os("MNEMOPORT_PASSPHRASE").is_some() {
+        let decrypted =
+            mnemo_package::decrypt_with_passphrase(&bytes, passphrase_from_environment()?)
+                .context("package decryption failed with the configured passphrase")?;
+        return Ok((
+            mnemo_package::verify(&decrypted).context("decrypted package verification failed")?,
+            true,
+        ));
+    }
+    anyhow::bail!(
+        "encrypted package needs its recipient identity (--identity or MNEMOPORT_IDENTITY_FILE) or MNEMOPORT_PASSPHRASE"
+    )
+}
+
+fn validate_full_fingerprint(fingerprint: &str) -> Result<()> {
+    let digest = fingerprint
+        .strip_prefix("sha256:")
+        .context("trusted signer fingerprint must use the full sha256:<64 lowercase hex> form")?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!(
+            "trusted signer fingerprint must use the full sha256:<64 lowercase hex> form"
+        );
+    }
+    Ok(())
 }
 
 fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {

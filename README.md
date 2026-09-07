@@ -11,7 +11,7 @@ Tool X              ->  canonical asset model    ->  Tool Y
 
 MnemoPort is an alpha available as prerelease binaries or from source. Its Rust CLI, signed and encrypted package format, transactional apply/undo, four offline adapters, four thin host Skills, and all 16 Core source→target smoke directions are implemented and tested. Native auto-memory stores, account/cloud data, plugin network installation, and broad preference migration remain deliberately non-automatic.
 
-MnemoPort is model-provider independent. It does not call an LLM API and never needs an OpenAI, Anthropic, DeepSeek, or other model-provider API key. It runs locally under the AI coding tool the user already authenticated. `MNEMOPORT_PASSPHRASE` is only a user-chosen encryption passphrase for a `.mnemo` package; it is not a model credential.
+MnemoPort is model-provider independent. It does not call an LLM API and never needs an OpenAI, Anthropic, DeepSeek, or other model-provider API key. It runs locally under the AI coding tool the user already authenticated. Package encryption uses either a destination-owned age identity or the user-chosen `MNEMOPORT_PASSPHRASE`; neither is a model credential.
 
 ## Supported hosts and assets
 
@@ -52,6 +52,8 @@ mnemo --version
 ```
 
 The other archives are `mnemoport-aarch64-apple-darwin.tar.gz` for Apple Silicon macOS and `mnemoport-x86_64-pc-windows-msvc.zip` for Windows x86-64. Verify the checksum before extracting, then place `mnemo` or `mnemo.exe` in a directory on `PATH`. See [release security](docs/release-security.md) to verify GitHub provenance.
+
+The recipient-encryption and trust-lifecycle commands documented below are implemented on `main` after `v0.1.0-alpha.1`; install from source until they appear in the next prerelease.
 
 ## Install the CLI from source
 
@@ -160,18 +162,24 @@ Do not reuse a stale plan. If target files change after planning, create a new o
 
 ### Cross-device or same-tool migration (X→X)
 
-On source device A, export an encrypted package. Qoder is only an example; replace both host identifiers with any supported source and target:
+Recipient encryption is the recommended cross-device flow because device A receives only device B's public key—no shared secret is sent back to the source. First, on target device B, generate a private identity outside a repository and copy only the public `recipient` from the JSON output:
 
 ```bash
-export MNEMOPORT_PASSPHRASE='choose-at-least-12-characters'
-mnemo inventory --from qoder --invoked-by qoder --json
-mnemo export --from qoder --invoked-by qoder --output qoder-assets.mnemo --json
+mnemo recipient generate --output "$HOME/.config/mnemoport/device-b.agekey" --json
+export MNEMOPORT_IDENTITY_FILE="$HOME/.config/mnemoport/device-b.agekey"
+mnemo recipient show --json
 ```
 
-Transfer only `qoder-assets.mnemo` through a channel you trust. On target device B, set the same passphrase through the shell or a secret manager:
+Keep the `.agekey` file private and backed up. MnemoPort creates it without overwriting an existing file and with private file permissions where the operating system supports them. Send the `age1...` recipient to source device A. Qoder is only an example; replace both host identifiers with any supported source and target:
 
 ```bash
-export MNEMOPORT_PASSPHRASE='choose-at-least-12-characters'
+mnemo inventory --from qoder --invoked-by qoder --json
+mnemo export --from qoder --invoked-by qoder --output qoder-assets.mnemo --recipient 'age1...' --json
+```
+
+Transfer `qoder-assets.mnemo` to target device B. With `MNEMOPORT_IDENTITY_FILE` still set there, use the normal destination workflow:
+
+```bash
 mnemo inspect qoder-assets.mnemo --json
 mnemo plan --input qoder-assets.mnemo --to qoder --invoked-by qoder --output migration-plan.json --json
 mnemo trust add --input qoder-assets.mnemo --label device-a --json
@@ -185,6 +193,25 @@ mnemo verify --input qoder-assets.mnemo --plan migration-plan.json --json
 ```
 
 Changing `--to qoder` to another supported host makes this a cross-device X→Y migration. X→X preserves exact native locations where the versioned adapter contract says that is safe; it still does not copy auth, sessions, caches, or undocumented databases.
+
+As an alternative, omit `--recipient` and set the same 12+ character `MNEMOPORT_PASSPHRASE` on both devices. The passphrase is never stored in the package. Recipient and plaintext modes are mutually exclusive.
+
+### Signing trust lifecycle
+
+Trust is local to the destination and separate from encryption. Verify a new source fingerprint through a trusted channel before `trust add`. If a source device is retired or lost, revoke its exact full fingerprint; prefixes are rejected:
+
+```bash
+mnemo trust list --json
+mnemo trust revoke sha256:<64-lowercase-hex> --json
+```
+
+For a planned device-key rotation, obtain and inspect a package signed by the replacement device, then atomically add the replacement and revoke the old signer:
+
+```bash
+mnemo trust rotate --from sha256:<old-64-lowercase-hex> --input replacement.mnemo --label device-a-new --json
+```
+
+Rotation changes only signer trust. It does not rotate or expose the destination age decryption identity.
 
 ### Windows PowerShell passphrase
 
@@ -244,7 +271,7 @@ export MNEMOPORT_PASSPHRASE='choose-at-least-12-characters'
 mnemo handoff --input handoff.json --output handoff.mnemo --json
 ```
 
-On the target, use the normal `inspect` → `plan` → `trust` → `apply` flow. The target receives a Markdown sidecar under its project; no internal session identifier, chat database, or authentication state is injected.
+For recipient encryption, replace the environment variable with `--recipient 'age1...'` and select the corresponding identity on the target. Then use the normal `inspect` → `plan` → `trust` → `apply` flow. The target receives a Markdown sidecar under its project; no internal session identifier, chat database, or authentication state is injected.
 
 ## Command reference
 
@@ -259,6 +286,10 @@ On the target, use the normal `inspect` → `plan` → `trust` → `apply` flow.
 | `mnemo plan --input FILE --to HOST --output PLAN` | No | Create a new immutable plan against the current target |
 | `mnemo trust add --input FILE` | MnemoPort state only | Trust the verified signing identity of one source device |
 | `mnemo trust list` | No | List locally trusted signer fingerprints |
+| `mnemo trust revoke FINGERPRINT` | MnemoPort state only | Revoke exactly one full signer fingerprint |
+| `mnemo trust rotate --from FINGERPRINT --input FILE` | MnemoPort state only | Atomically trust a replacement package signer and revoke the old signer |
+| `mnemo recipient generate --output FILE` | MnemoPort identity file only | Create a destination-owned age identity and return its public recipient |
+| `mnemo recipient show [--identity FILE]` | No | Derive the public recipient without exposing the private identity |
 | `mnemo apply --input FILE --plan PLAN --approve TOKEN` | Yes | Revalidate and transactionally write approved target files |
 | `mnemo verify --input FILE --plan PLAN [--level l0\|l1]` | Disposable L1 probe state only | Compare target hashes; optionally request exact-tuple native asset discovery |
 | `mnemo report ID` | No | Read operation status and journal count |
@@ -266,7 +297,7 @@ On the target, use the normal `inspect` → `plan` → `trust` → `apply` flow.
 | `mnemo recovery list` | No | Classify prepared journals left by an interruption |
 | `mnemo recovery rollback TRANSACTION_ID` | Yes | Safely close or restore one unambiguous prepared transaction |
 | `mnemo integration install/status/uninstall` | Host Skill only | Manage the thin integration with ownership checks |
-| `mnemo handoff --input JSON --output FILE` | No | Package a user-selected new-session capsule |
+| `mnemo handoff --input JSON --output FILE [--recipient AGE_RECIPIENT]` | No | Package a user-selected new-session capsule |
 
 Use `mnemo <command> --help` for all flags. Add `--json` for the stable response envelope used by Skills and scripts.
 
@@ -313,7 +344,7 @@ The alpha does not perform network plugin/extension installation, CLI dependency
 ## Troubleshooting
 
 - **`mnemo: command not found`:** add Cargo's binary directory to `PATH`, then open a new shell.
-- **Encrypted package asks for a passphrase:** set `MNEMOPORT_PASSPHRASE` to the same 12+ character value on source and target. The value is not stored in the package.
+- **Encrypted package cannot be opened:** for recipient encryption, pass `--identity <path>` or set `MNEMOPORT_IDENTITY_FILE` on the destination. For passphrase encryption, set the same 12+ character `MNEMOPORT_PASSPHRASE` on both devices.
 - **Exit code 2:** inspect `skipped_assets` and manual operations. The safe subset completed, but the whole requested scope did not.
 - **Signer is not trusted:** run `inspect`, verify the displayed fingerprint through a trusted channel, then run `mnemo trust add --input <package>`.
 - **Plan drift or approval mismatch:** discard the plan, choose a new plan output filename, and run `plan` again against the current target.
