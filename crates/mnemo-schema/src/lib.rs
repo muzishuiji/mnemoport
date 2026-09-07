@@ -352,6 +352,37 @@ pub struct AssetProvenance {
     pub source_hash: String,
     /// Whether a model inferred any of the canonical semantics.
     pub model_inferred: bool,
+    /// Portable workspace identity for workspace/project-scoped assets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+}
+
+/// Portable identity for one explicitly selected source workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDescriptor {
+    /// Descriptor schema version.
+    pub schema_version: String,
+    /// Content-derived portable identity; never an absolute source path.
+    pub workspace_id: String,
+    /// User-supplied label unique within one package.
+    pub label: String,
+    /// Optional hash of a credential-free normalized Git remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_remote_hash: Option<String>,
+    /// Optional Git revision observed during export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_head: Option<String>,
+}
+
+/// Target-local mapping from portable workspace identities to destination roots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceMap {
+    /// Mapping schema version.
+    pub schema_version: String,
+    /// Exact workspace id to target path mappings.
+    pub mappings: BTreeMap<String, String>,
 }
 
 /// Canonical transport for an MCP server without embedded credentials.
@@ -553,6 +584,9 @@ pub struct MigrationPlan {
     pub adapter_version: String,
     /// Hash of the capability snapshot used for decisions.
     pub capability_snapshot_hash: String,
+    /// Canonical target-local workspace mappings bound into the plan identity.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace_mappings: BTreeMap<String, String>,
     /// Ordered operations.
     pub operations: Vec<PlanOperation>,
 }
@@ -655,12 +689,17 @@ mod tests {
         let asset_schema = include_str!("../../../schemas/canonical-asset.schema.json");
         let plan_schema = include_str!("../../../schemas/migration-plan.schema.json");
         let handoff_schema = include_str!("../../../schemas/handoff.schema.json");
+        let workspace_descriptor_schema =
+            include_str!("../../../schemas/workspace-descriptor.schema.json");
+        let workspace_map_schema = include_str!("../../../schemas/workspace-map.schema.json");
         for schema in [
             command_schema,
             tuple_schema,
             asset_schema,
             plan_schema,
             handoff_schema,
+            workspace_descriptor_schema,
+            workspace_map_schema,
         ] {
             assert!(serde_json::from_str::<serde_json::Value>(schema).is_ok());
         }

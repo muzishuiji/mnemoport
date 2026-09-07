@@ -18,7 +18,7 @@ The Rust core owns deterministic schemas, path and content policy, package verif
 2. `inventory` reports supported and inventory-only assets without asset bodies.
 3. `export` extracts supported assets, removes credential values, signs, compresses, and encrypts one `.mnemo` file to a destination recipient or passphrase.
 4. `inspect` decrypts and verifies the package without target writes.
-5. `plan` renders against the exact target tuple and snapshots current target hashes.
+5. `plan` resolves any explicit portable workspace ids through a target-local map, renders against the exact target tuple, and snapshots the canonical mappings plus current target hashes.
 6. `apply` rebuilds the plan, rejects drift, then commits local files with journals and backups; its ledger transaction and managed-object ownership update are atomic.
 7. `verify` independently rebuilds L0 target bytes and checks current target hashes. With `--level l1`, it may then run an exact-tuple native discovery recipe against a disposable clone.
 8. `report` reads operation and journal evidence from the local ledger.
@@ -31,6 +31,8 @@ Product discovery is also split by effect. `detect` only resolves files and exec
 For same-tool moves between devices, `handoff` packages a user-selected new-session capsule using the same signing and encryption path. The destination receives a Markdown sidecar; MnemoPort never injects a private session database.
 
 Plans are target-device artifacts. A cross-device package is created on source device A, while the plan is created on target device B so its preconditions describe the actual destination. For recipient encryption, B generates the private age identity and gives A only the public recipient. Signing trust remains a separate explicit destination decision and supports exact-fingerprint revocation and atomic signer rotation.
+
+For a multi-root source, each explicitly selected workspace receives a portable identity derived from its user-supplied label. Collection runs against each root without changing process-wide current directory, tags only workspace/project assets, and de-duplicates repeated user/device assets. Absolute source roots never enter the canonical asset or package. On the destination, the Workspace Map must bind the exact descriptor-id set to unique, existing, absolute, non-symlink directories. Canonical target roots are included in the plan id; `apply` and `verify` revalidate and reuse those bindings without accepting a second map. See [Workspace mapping](workspace-mapping.md).
 
 JSON commands return `0` only when the requested scope is fully complete, `2` when the safe portion completed with manual/conditional work, `3` for conflicts or target drift, `4` for a safety refusal, `5` for unavailable dependency/trust state, `6` for incompatible input, and `70` for an internal failure.
 

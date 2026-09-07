@@ -14,7 +14,7 @@ use mnemo_schema::{
     ApplyPhase, ApprovalClass, AssetKind, AssetPayload, AssetProbe, AssetProbeMethod,
     AssetProbeStatus, Entrypoint, MigrationPlan, PlanOperation, PlanOperationKind,
     PlanPrecondition, Platform, ProbeStatus, ProductProbe, ProductTuple, RollbackGuarantee,
-    Sensitivity,
+    ScopeLevel, Sensitivity, WorkspaceDescriptor, WorkspaceMap,
 };
 use mnemo_security::{FindingSeverity, scan_and_redact, sha256_id, validate_portable_path};
 use mnemo_store::{
@@ -115,6 +115,27 @@ pub struct TargetRoots {
     pub user_home: PathBuf,
     /// Selected target workspace.
     pub workspace: PathBuf,
+    /// Explicit portable workspace id to canonical target root mappings.
+    pub workspace_mappings: BTreeMap<String, PathBuf>,
+}
+
+/// One explicitly selected source workspace. Its local path is never serialized
+/// into a package; only the portable descriptor crosses devices.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSource {
+    /// Portable descriptor embedded in the package.
+    pub descriptor: WorkspaceDescriptor,
+    /// Canonical local source root used only during collection.
+    pub path: PathBuf,
+}
+
+/// Verified package contents including optional portable workspace metadata.
+#[derive(Debug, Clone)]
+pub struct MigrationBundle {
+    /// Canonical extracted assets.
+    pub assets: Vec<ExtractedAsset>,
+    /// Explicit workspaces referenced by workspace/project assets.
+    pub workspaces: Vec<WorkspaceDescriptor>,
 }
 
 /// One fully rendered target file. Bytes are omitted from JSON reports and only
@@ -129,6 +150,9 @@ pub struct PreparedFile {
     pub root: String,
     /// Portable path relative to the logical root.
     pub relative_path: String,
+    /// Portable workspace identity when the logical root is a mapped workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     /// Resolved target path.
     pub target_path: PathBuf,
     /// Desired content hash.
@@ -231,6 +255,7 @@ pub fn build_file_plan(
     target: ProductTuple,
     adapter_version: impl Into<String>,
     capability_snapshot_hash: impl Into<String>,
+    workspace_mappings: BTreeMap<String, String>,
     candidates: Vec<FilePlanCandidate>,
 ) -> Result<MigrationPlan, CoreError> {
     let mut operations = Vec::with_capacity(candidates.len());
@@ -269,6 +294,7 @@ pub fn build_file_plan(
         target,
         adapter_version: adapter_version.into(),
         capability_snapshot_hash: capability_snapshot_hash.into(),
+        workspace_mappings,
         operations,
     };
     plan.plan_id = sha256_id(&serde_json::to_vec(&plan)?);
@@ -297,8 +323,108 @@ pub fn resolve_target_roots(
             product_config,
             user_home: user_home()?,
             workspace: workspace.to_path_buf(),
+            workspace_mappings: BTreeMap::new(),
         },
     ))
+}
+
+/// Build and validate a portable descriptor from a user-selected label.
+pub fn workspace_descriptor(label: &str) -> Result<WorkspaceDescriptor, CoreError> {
+    let label = label.trim();
+    if label.is_empty()
+        || label.len() > 64
+        || label.chars().any(char::is_control)
+        || label.contains(['/', '\\', '='])
+        || label == "."
+        || label == ".."
+    {
+        return Err(CoreError::InvalidBundle(
+            "invalid workspace label; use 1-64 visible characters without '/', '\\', or '='"
+                .to_owned(),
+        ));
+    }
+    Ok(WorkspaceDescriptor {
+        schema_version: "1.0".to_owned(),
+        workspace_id: workspace_id_for_label(label),
+        label: label.to_owned(),
+        git_remote_hash: None,
+        git_head: None,
+    })
+}
+
+/// Validate an exact target-local mapping and return canonical destination
+/// roots. Mapping keys must exactly equal the package descriptor ids.
+pub fn resolve_workspace_mappings(
+    descriptors: &[WorkspaceDescriptor],
+    workspace_map: Option<&WorkspaceMap>,
+) -> Result<BTreeMap<String, PathBuf>, CoreError> {
+    validate_workspace_descriptors(descriptors)?;
+    if descriptors.is_empty() {
+        if workspace_map.is_some_and(|map| !map.mappings.is_empty()) {
+            return Err(CoreError::InvalidBundle(
+                "invalid workspace map: package has no explicit workspaces".to_owned(),
+            ));
+        }
+        return Ok(BTreeMap::new());
+    }
+    let workspace_map = workspace_map.ok_or_else(|| {
+        CoreError::InvalidBundle(
+            "invalid workspace map: this package requires --workspace-map".to_owned(),
+        )
+    })?;
+    if workspace_map.schema_version != "1.0" {
+        return Err(CoreError::InvalidBundle(format!(
+            "invalid workspace map schema {}",
+            workspace_map.schema_version
+        )));
+    }
+    let expected = descriptors
+        .iter()
+        .map(|descriptor| descriptor.workspace_id.clone())
+        .collect::<BTreeSet<_>>();
+    let actual = workspace_map
+        .mappings
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if expected != actual {
+        return Err(CoreError::InvalidBundle(
+            "invalid workspace map: keys must exactly match package workspace ids".to_owned(),
+        ));
+    }
+    let mut resolved = BTreeMap::new();
+    let mut destinations = BTreeSet::new();
+    for (workspace_id, value) in &workspace_map.mappings {
+        let path = Path::new(value);
+        if !path.is_absolute() {
+            return Err(CoreError::InvalidBundle(format!(
+                "invalid workspace map: destination for {workspace_id} must be absolute"
+            )));
+        }
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            CoreError::InvalidBundle(format!(
+                "invalid workspace map: destination for {workspace_id} does not exist or cannot be read: {error}"
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(CoreError::InvalidBundle(format!(
+                "invalid workspace map: destination for {workspace_id} must be an existing non-symlink directory"
+            )));
+        }
+        let canonical = fs::canonicalize(path).map_err(|error| {
+            CoreError::InvalidBundle(format!(
+                "invalid workspace map: destination for {workspace_id} cannot be canonicalized: {error}"
+            ))
+        })?;
+        let identity = canonical.to_string_lossy().into_owned();
+        if !destinations.insert(identity) {
+            return Err(CoreError::InvalidBundle(
+                "invalid workspace map: destination roots must be unique".to_owned(),
+            ));
+        }
+        resolved.insert(workspace_id.clone(), canonical);
+    }
+    Ok(resolved)
 }
 
 /// Render and plan supported assets for an exact target tuple. Existing target
@@ -351,7 +477,8 @@ pub fn prepare_migration_with_managed(
             }
         };
         for file in rendered {
-            let target_path = resolve_rendered_path(roots, &file);
+            let workspace_id = asset.asset.provenance.workspace_id.clone();
+            let target_path = resolve_rendered_path(roots, &file, workspace_id.as_deref())?;
             let desired_hash = sha256_id(&file.bytes);
             if let Some(existing) = prepared.get(&target_path) {
                 if asset.asset.kind == mnemo_schema::AssetKind::Mcp {
@@ -364,6 +491,7 @@ pub fn prepare_migration_with_managed(
                             asset_kind: asset.asset.kind,
                             root: target_root_name(file.root).to_owned(),
                             relative_path: file.relative_path,
+                            workspace_id,
                             target_path,
                             desired_hash,
                             bytes: file.bytes,
@@ -388,6 +516,7 @@ pub fn prepare_migration_with_managed(
                     asset_kind: asset.asset.kind,
                     root: target_root_name(file.root).to_owned(),
                     relative_path: file.relative_path,
+                    workspace_id,
                     target_path,
                     desired_hash,
                     bytes: file.bytes,
@@ -405,12 +534,7 @@ pub fn prepare_migration_with_managed(
             FilePlanCandidate {
                 asset_id: file.asset_id.clone(),
                 desired_hash: file.desired_hash.clone(),
-                effect: serde_json::json!({
-                    "root": file.root,
-                    "relative_path": file.relative_path,
-                    "target_path": file.target_path,
-                    "desired_hash": file.desired_hash,
-                }),
+                effect: prepared_file_effect(file),
                 verification: serde_json::json!({
                     "level": "l0",
                     "sha256": file.desired_hash,
@@ -432,11 +556,17 @@ pub fn prepare_migration_with_managed(
         .collect::<Vec<_>>()
         .join("\0");
     let capability_hash = sha256_id(&serde_json::to_vec(&target)?);
+    let workspace_mappings = roots
+        .workspace_mappings
+        .iter()
+        .map(|(workspace_id, path)| (workspace_id.clone(), path.to_string_lossy().into_owned()))
+        .collect();
     let plan = build_file_plan(
         sha256_id(source_material.as_bytes()),
         target,
         env!("CARGO_PKG_VERSION"),
         capability_hash,
+        workspace_mappings,
         candidates,
     )?;
     Ok(PreparedMigration {
@@ -444,6 +574,22 @@ pub fn prepare_migration_with_managed(
         files,
         skipped,
     })
+}
+
+fn prepared_file_effect(file: &PreparedFile) -> Value {
+    let mut effect = serde_json::json!({
+        "root": file.root,
+        "relative_path": file.relative_path,
+        "target_path": file.target_path,
+        "desired_hash": file.desired_hash,
+    });
+    if let (Some(workspace_id), Some(object)) = (&file.workspace_id, effect.as_object_mut()) {
+        object.insert(
+            "workspace_id".to_owned(),
+            Value::String(workspace_id.clone()),
+        );
+    }
+    effect
 }
 
 fn render_core_asset(
@@ -470,7 +616,15 @@ fn render_mcp_asset(
         Platform::Qoder => mnemo_adapter_qoder::render_mcp_target(asset, None),
         Platform::Cursor => mnemo_adapter_cursor::render_mcp_target(asset, None),
     }?;
-    let target_path = resolve_rendered_path(roots, &initial);
+    let target_path = resolve_rendered_path(
+        roots,
+        &initial,
+        asset.asset.provenance.workspace_id.as_deref(),
+    )
+    .map_err(|error| AdapterError::InvalidData {
+        path: PathBuf::from(&initial.relative_path),
+        message: error.to_string(),
+    })?;
     let existing = prepared
         .get(&target_path)
         .map(|file| file.bytes.clone())
@@ -486,13 +640,24 @@ fn render_mcp_asset(
     Ok(vec![rendered])
 }
 
-fn resolve_rendered_path(roots: &TargetRoots, file: &RenderedFile) -> PathBuf {
+fn resolve_rendered_path(
+    roots: &TargetRoots,
+    file: &RenderedFile,
+    workspace_id: Option<&str>,
+) -> Result<PathBuf, CoreError> {
     let root = match file.root {
         TargetRoot::ProductConfig => &roots.product_config,
         TargetRoot::UserHome => &roots.user_home,
-        TargetRoot::Workspace => &roots.workspace,
+        TargetRoot::Workspace => match workspace_id {
+            Some(workspace_id) => roots.workspace_mappings.get(workspace_id).ok_or_else(|| {
+                CoreError::InvalidBundle(format!(
+                    "invalid workspace map: missing destination for {workspace_id}"
+                ))
+            })?,
+            None => &roots.workspace,
+        },
     };
-    root.join(&file.relative_path)
+    Ok(root.join(&file.relative_path))
 }
 
 const fn target_root_name(root: TargetRoot) -> &'static str {
@@ -585,6 +750,17 @@ pub fn verify_asset_discovery(
             .as_ref()
             .is_some_and(|report| report.status != ProbeStatus::Verified);
         let report = match (tuple.platform, &tuple.entrypoint, asset_kind) {
+            _ if !roots.workspace_mappings.is_empty() => asset_probe_result(
+                tuple.clone(),
+                asset_kind,
+                AssetProbeStatus::Manual,
+                AssetProbeMethod::None,
+                Vec::new(),
+                "multi_workspace_asset_recipe_not_yet_admitted",
+                expected_assets,
+                0,
+                false,
+            ),
             (Platform::Codex, Entrypoint::Cli, AssetKind::Mcp)
                 if tuple.version.as_deref() == Some("0.144.1") && tuple.os == "linux" =>
             {
@@ -1029,6 +1205,58 @@ pub fn inventory(
     Ok(adapter.inventory(mode)?)
 }
 
+/// Inventory one platform at an explicit local workspace without changing the
+/// process working directory.
+pub fn inventory_at(
+    platform: Platform,
+    mode: CollectionMode,
+    workspace: &Path,
+) -> Result<Vec<InventoryItem>, CoreError> {
+    let adapter = adapters()
+        .into_iter()
+        .find(|candidate| candidate.platform() == platform)
+        .ok_or_else(|| {
+            CoreError::InvalidBundle(format!("adapter missing for {}", platform.as_str()))
+        })?;
+    Ok(adapter.inventory_at(mode, workspace)?)
+}
+
+/// Inventory all explicit source workspaces, tagging workspace/project items
+/// and de-duplicating repeated user/device assets.
+pub fn inventory_workspaces(
+    platform: Platform,
+    mode: CollectionMode,
+    sources: &[WorkspaceSource],
+) -> Result<Vec<InventoryItem>, CoreError> {
+    validate_workspace_sources(sources)?;
+    let adapter = adapters()
+        .into_iter()
+        .find(|candidate| candidate.platform() == platform)
+        .ok_or_else(|| {
+            CoreError::InvalidBundle(format!("adapter missing for {}", platform.as_str()))
+        })?;
+    let mut items = BTreeMap::new();
+    for source in sources {
+        for mut item in adapter.inventory_at(mode, &source.path)? {
+            if is_workspace_scope(item.scope) {
+                item.workspace_id = Some(source.descriptor.workspace_id.clone());
+                item.id = sha256_id(
+                    format!("{}\0{}", item.id, source.descriptor.workspace_id).as_bytes(),
+                );
+            }
+            if let Some(existing) = items.insert(item.id.clone(), item.clone()) {
+                if existing != item {
+                    return Err(CoreError::InvalidBundle(format!(
+                        "inventory identity collision for {}",
+                        item.id
+                    )));
+                }
+            }
+        }
+    }
+    Ok(items.into_values().collect())
+}
+
 /// Extract canonical assets from one platform.
 pub fn extract(platform: Platform, mode: CollectionMode) -> Result<Vec<ExtractedAsset>, CoreError> {
     let adapter = adapters()
@@ -1040,13 +1268,116 @@ pub fn extract(platform: Platform, mode: CollectionMode) -> Result<Vec<Extracted
     Ok(adapter.extract(mode)?)
 }
 
+/// Extract one platform at an explicit local workspace without changing the
+/// process working directory.
+pub fn extract_at(
+    platform: Platform,
+    mode: CollectionMode,
+    workspace: &Path,
+) -> Result<Vec<ExtractedAsset>, CoreError> {
+    let adapter = adapters()
+        .into_iter()
+        .find(|candidate| candidate.platform() == platform)
+        .ok_or_else(|| {
+            CoreError::InvalidBundle(format!("adapter missing for {}", platform.as_str()))
+        })?;
+    Ok(adapter.extract_at(mode, workspace)?)
+}
+
+/// Extract all explicit source workspaces into one portable bundle.
+pub fn extract_workspaces(
+    platform: Platform,
+    mode: CollectionMode,
+    sources: &[WorkspaceSource],
+) -> Result<MigrationBundle, CoreError> {
+    validate_workspace_sources(sources)?;
+    let adapter = adapters()
+        .into_iter()
+        .find(|candidate| candidate.platform() == platform)
+        .ok_or_else(|| {
+            CoreError::InvalidBundle(format!("adapter missing for {}", platform.as_str()))
+        })?;
+    let mut assets = BTreeMap::new();
+    for source in sources {
+        for extracted in adapter.extract_at(mode, &source.path)? {
+            let extracted = if is_workspace_scope(extracted.asset.scope) {
+                with_workspace_id(extracted, &source.descriptor.workspace_id)?
+            } else {
+                extracted
+            };
+            let asset_id = extracted.asset.asset_id.clone();
+            if let Some(existing) = assets.insert(asset_id.clone(), extracted.clone()) {
+                if existing != extracted {
+                    return Err(CoreError::InvalidBundle(format!(
+                        "asset identity collision for {asset_id}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(MigrationBundle {
+        assets: assets.into_values().collect(),
+        workspaces: sources
+            .iter()
+            .map(|source| source.descriptor.clone())
+            .collect(),
+    })
+}
+
+fn with_workspace_id(
+    extracted: ExtractedAsset,
+    workspace_id: &str,
+) -> Result<ExtractedAsset, CoreError> {
+    let old = extracted.asset;
+    let asset = make_asset(CanonicalAssetInput {
+        platform: old.provenance.platform,
+        kind: old.kind,
+        scope: old.scope,
+        title: old.title,
+        locator: old.provenance.locator,
+        payload: old.payload,
+        source_hash: old.provenance.source_hash,
+        content_hash: old.content_hash,
+        sensitivity: old.sensitivity,
+        workspace_id: Some(workspace_id.to_owned()),
+    })?;
+    Ok(ExtractedAsset {
+        asset,
+        objects: extracted.objects,
+    })
+}
+
+const fn is_workspace_scope(scope: ScopeLevel) -> bool {
+    matches!(scope, ScopeLevel::Workspace | ScopeLevel::Project)
+}
+
 /// Encode extracted canonical assets and their referenced blobs into a signed
 /// deterministic package.
 pub fn package_assets(
     assets: &[ExtractedAsset],
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<SignedPackage, CoreError> {
+    package_assets_with_workspaces(assets, &[], signing_key)
+}
+
+/// Encode assets plus portable workspace descriptors into a signed package.
+pub fn package_assets_with_workspaces(
+    assets: &[ExtractedAsset],
+    workspaces: &[WorkspaceDescriptor],
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<SignedPackage, CoreError> {
+    validate_workspace_descriptors(workspaces)?;
+    validate_asset_workspace_references(assets, workspaces)?;
     let mut builder = PackageBuilder::new();
+    if !workspaces.is_empty() {
+        builder.require_feature("portable-workspaces");
+    }
+    for descriptor in workspaces {
+        builder.insert(
+            format!("workspaces/{}.json", descriptor.workspace_id),
+            serde_json::to_vec(descriptor)?,
+        )?;
+    }
     let mut blobs = BTreeMap::<String, Vec<u8>>::new();
     for extracted in assets {
         validate_extracted_asset(extracted)?;
@@ -1080,6 +1411,12 @@ pub fn package_assets(
 
 /// Reconstruct canonical assets after package signature and object verification.
 pub fn unpack_assets(package: &VerifiedPackage) -> Result<Vec<ExtractedAsset>, CoreError> {
+    Ok(unpack_bundle(package)?.assets)
+}
+
+/// Reconstruct canonical assets and portable workspace descriptors after
+/// package signature and object verification.
+pub fn unpack_bundle(package: &VerifiedPackage) -> Result<MigrationBundle, CoreError> {
     let mut blobs = BTreeMap::new();
     for (path, bytes) in &package.objects {
         if let Some(digest) = path.strip_prefix("blobs/sha256/") {
@@ -1092,6 +1429,34 @@ pub fn unpack_assets(package: &VerifiedPackage) -> Result<Vec<ExtractedAsset>, C
             blobs.insert(hash, bytes.clone());
         }
     }
+    let mut workspaces = Vec::new();
+    for (path, bytes) in &package.objects {
+        if !path.starts_with("workspaces/") {
+            continue;
+        }
+        let descriptor: WorkspaceDescriptor = serde_json::from_slice(bytes)?;
+        let expected_path = format!("workspaces/{}.json", descriptor.workspace_id);
+        if *path != expected_path {
+            return Err(CoreError::InvalidBundle(format!(
+                "workspace id/path mismatch: {path}"
+            )));
+        }
+        workspaces.push(descriptor);
+    }
+    workspaces.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
+    if !workspaces.is_empty()
+        && !package
+            .manifest
+            .header
+            .required_features
+            .iter()
+            .any(|feature| feature == "portable-workspaces")
+    {
+        return Err(CoreError::InvalidBundle(
+            "workspace descriptors require the portable-workspaces package feature".to_owned(),
+        ));
+    }
+    validate_workspace_descriptors(&workspaces)?;
     let mut assets = Vec::new();
     for (path, bytes) in &package.objects {
         let Some(_encoded_asset_id) = path
@@ -1120,7 +1485,135 @@ pub fn unpack_assets(package: &VerifiedPackage) -> Result<Vec<ExtractedAsset>, C
         assets.push(extracted);
     }
     assets.sort_by(|left, right| left.asset.asset_id.cmp(&right.asset.asset_id));
-    Ok(assets)
+    validate_asset_workspace_references(&assets, &workspaces)?;
+    Ok(MigrationBundle { assets, workspaces })
+}
+
+fn workspace_id_for_label(label: &str) -> String {
+    sha256_id(format!("workspace\0{label}").as_bytes())
+}
+
+fn validate_workspace_descriptors(workspaces: &[WorkspaceDescriptor]) -> Result<(), CoreError> {
+    let mut ids = BTreeSet::new();
+    let mut labels = BTreeSet::new();
+    for descriptor in workspaces {
+        let expected = workspace_descriptor(&descriptor.label)?;
+        if descriptor.schema_version != "1.0" {
+            return Err(CoreError::InvalidBundle(format!(
+                "unsupported workspace schema {}",
+                descriptor.schema_version
+            )));
+        }
+        if descriptor.label != expected.label
+            || descriptor.workspace_id != expected.workspace_id
+            || !is_sha256_id(&descriptor.workspace_id)
+        {
+            return Err(CoreError::InvalidBundle(format!(
+                "workspace {} identity mismatch",
+                descriptor.label
+            )));
+        }
+        if !ids.insert(descriptor.workspace_id.clone()) || !labels.insert(descriptor.label.clone())
+        {
+            return Err(CoreError::InvalidBundle(
+                "workspace ids and labels must be unique".to_owned(),
+            ));
+        }
+        if descriptor
+            .git_remote_hash
+            .as_deref()
+            .is_some_and(|hash| !is_sha256_id(hash))
+        {
+            return Err(CoreError::InvalidBundle(format!(
+                "workspace {} has an invalid Git remote hash",
+                descriptor.label
+            )));
+        }
+        if descriptor.git_head.as_deref().is_some_and(|head| {
+            !(7..=64).contains(&head.len()) || !head.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err(CoreError::InvalidBundle(format!(
+                "workspace {} has an invalid Git revision",
+                descriptor.label
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_workspace_sources(sources: &[WorkspaceSource]) -> Result<(), CoreError> {
+    if sources.is_empty() {
+        return Err(CoreError::InvalidBundle(
+            "invalid workspace selection: at least one workspace is required".to_owned(),
+        ));
+    }
+    let descriptors = sources
+        .iter()
+        .map(|source| source.descriptor.clone())
+        .collect::<Vec<_>>();
+    validate_workspace_descriptors(&descriptors)?;
+    let mut paths = BTreeSet::new();
+    for source in sources {
+        if !source.path.is_absolute() || !source.path.is_dir() {
+            return Err(CoreError::InvalidBundle(format!(
+                "invalid workspace selection for {}: source must be an existing absolute directory",
+                source.descriptor.label
+            )));
+        }
+        let canonical = fs::canonicalize(&source.path)?;
+        if canonical != source.path {
+            return Err(CoreError::InvalidBundle(format!(
+                "invalid workspace selection for {}: source must be canonical",
+                source.descriptor.label
+            )));
+        }
+        if !paths.insert(canonical) {
+            return Err(CoreError::InvalidBundle(
+                "invalid workspace selection: source roots must be unique".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_asset_workspace_references(
+    assets: &[ExtractedAsset],
+    workspaces: &[WorkspaceDescriptor],
+) -> Result<(), CoreError> {
+    let ids = workspaces
+        .iter()
+        .map(|descriptor| descriptor.workspace_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for extracted in assets {
+        let workspace_id = extracted.asset.provenance.workspace_id.as_deref();
+        if !is_workspace_scope(extracted.asset.scope) && workspace_id.is_some() {
+            return Err(CoreError::InvalidBundle(format!(
+                "asset {} has a workspace id outside workspace/project scope",
+                extracted.asset.asset_id
+            )));
+        }
+        if workspaces.is_empty() && workspace_id.is_some() {
+            return Err(CoreError::InvalidBundle(format!(
+                "asset {} references a missing workspace descriptor",
+                extracted.asset.asset_id
+            )));
+        }
+        if !workspaces.is_empty() && is_workspace_scope(extracted.asset.scope) {
+            let workspace_id = workspace_id.ok_or_else(|| {
+                CoreError::InvalidBundle(format!(
+                    "asset {} is missing a workspace id",
+                    extracted.asset.asset_id
+                ))
+            })?;
+            if !ids.contains(workspace_id) {
+                return Err(CoreError::InvalidBundle(format!(
+                    "asset {} references an unknown workspace",
+                    extracted.asset.asset_id
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn referenced_hashes(payload: &mnemo_schema::AssetPayload) -> Vec<String> {
@@ -1160,6 +1653,7 @@ fn validate_extracted_asset(extracted: &ExtractedAsset) -> Result<(), CoreError>
         source_hash: asset.provenance.source_hash.clone(),
         content_hash,
         sensitivity: asset.sensitivity,
+        workspace_id: asset.provenance.workspace_id.clone(),
     })?;
     if reconstructed.asset_id != asset.asset_id {
         return Err(CoreError::InvalidBundle(format!(
@@ -1302,7 +1796,10 @@ fn file_tree_entries(payload: &AssetPayload) -> impl Iterator<Item = (&str, &str
 
 fn is_sha256_id(value: &str) -> bool {
     value.strip_prefix("sha256:").is_some_and(|digest| {
-        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     })
 }
 
@@ -1361,6 +1858,7 @@ pub fn create_handoff(capsule: &mnemo_schema::HandoffCapsule) -> Result<Extracte
         source_hash: content_hash.clone(),
         content_hash,
         sensitivity: mnemo_schema::Sensitivity::Private,
+        workspace_id: None,
     })?;
     let extracted = ExtractedAsset {
         asset,
@@ -1375,7 +1873,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use mnemo_adapter_common::{CollectionMode, TargetRoot};
     use mnemo_schema::{Entrypoint, EvidenceLevel, PlanOperationKind, Platform, ProductTuple};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn registry_has_all_four_platforms() {
@@ -1418,6 +1916,7 @@ mod tests {
             target(),
             "0.1.0",
             "sha256:caps",
+            BTreeMap::new(),
             vec![candidate.clone()],
         )?;
         let second = super::build_file_plan(
@@ -1425,10 +1924,18 @@ mod tests {
             target(),
             "0.1.0",
             "sha256:caps",
+            BTreeMap::new(),
             vec![candidate],
         )?;
         assert_eq!(first, second);
         assert_eq!(first.operations[0].kind, PlanOperationKind::Noop);
+        let encoded = serde_json::to_value(&first)?;
+        assert!(encoded.get("workspace_mappings").is_none());
+        assert!(
+            encoded["operations"][0]["effect"]
+                .get("workspace_id")
+                .is_none()
+        );
         Ok(())
     }
 
@@ -1639,12 +2146,143 @@ mod tests {
                 product_config: temp.path().join("codex-home"),
                 user_home: temp.path().join("user-home"),
                 workspace: target_repo,
+                workspace_mappings: BTreeMap::new(),
             },
             &transported,
         )?;
         assert!(prepared.files.is_empty());
         assert_eq!(prepared.skipped.len(), 1);
         assert!(prepared.skipped[0].reason.contains("quarantined"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_bundle_is_portable_and_feature_gated() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("private-source-root");
+        let config = temp.path().join("qoder-config");
+        std::fs::create_dir_all(&source)?;
+        std::fs::create_dir_all(&config)?;
+        std::fs::write(source.join("AGENTS.md"), "Keep workspace boundaries.\n")?;
+        let collected = mnemo_adapter_qoder::collect_from_roots(
+            &config,
+            &source,
+            CollectionMode::OfflineStatic,
+        )?;
+        let descriptor = super::workspace_descriptor("backend")?;
+        let assets = collected
+            .extracted
+            .into_iter()
+            .map(|asset| super::with_workspace_id(asset, &descriptor.workspace_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let signed = super::package_assets_with_workspaces(
+            &assets,
+            std::slice::from_ref(&descriptor),
+            &SigningKey::from_bytes(&[12; 32]),
+        )?;
+        assert!(
+            signed
+                .manifest
+                .header
+                .required_features
+                .contains(&"portable-workspaces".to_owned())
+        );
+        let verified = mnemo_package::verify(&signed.bytes)?;
+        let source_path = source.to_string_lossy();
+        assert!(
+            verified
+                .objects
+                .values()
+                .all(|bytes| !String::from_utf8_lossy(bytes).contains(source_path.as_ref()))
+        );
+        let bundle = super::unpack_bundle(&verified)?;
+        assert_eq!(bundle.workspaces, vec![descriptor.clone()]);
+        assert_eq!(
+            bundle.assets[0].asset.provenance.workspace_id.as_ref(),
+            Some(&descriptor.workspace_id)
+        );
+
+        let mut undeclared = mnemo_package::PackageBuilder::new();
+        for (path, bytes) in &verified.objects {
+            undeclared.insert(path, bytes.clone())?;
+        }
+        let undeclared = undeclared.build(&SigningKey::from_bytes(&[14; 32]))?;
+        let undeclared = mnemo_package::verify(&undeclared.bytes)?;
+        assert!(super::unpack_bundle(&undeclared).is_err());
+
+        let legacy = super::package_assets(&bundle.assets, &SigningKey::from_bytes(&[13; 32]));
+        assert!(legacy.is_err(), "workspace references require descriptors");
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_map_requires_an_exact_unique_existing_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first)?;
+        std::fs::create_dir_all(&second)?;
+        let alpha = super::workspace_descriptor("alpha")?;
+        let beta = super::workspace_descriptor("beta")?;
+        let descriptors = vec![alpha.clone(), beta.clone()];
+        let valid = mnemo_schema::WorkspaceMap {
+            schema_version: "1.0".to_owned(),
+            mappings: BTreeMap::from([
+                (
+                    alpha.workspace_id.clone(),
+                    first.canonicalize()?.to_string_lossy().into_owned(),
+                ),
+                (
+                    beta.workspace_id.clone(),
+                    second.canonicalize()?.to_string_lossy().into_owned(),
+                ),
+            ]),
+        };
+        let resolved = super::resolve_workspace_mappings(&descriptors, Some(&valid))?;
+        assert_eq!(resolved.len(), 2);
+
+        let mut missing = valid.clone();
+        missing.mappings.remove(&beta.workspace_id);
+        assert!(super::resolve_workspace_mappings(&descriptors, Some(&missing)).is_err());
+
+        let mut duplicate = valid;
+        duplicate.mappings.insert(
+            beta.workspace_id,
+            first.canonicalize()?.to_string_lossy().into_owned(),
+        );
+        assert!(super::resolve_workspace_mappings(&descriptors, Some(&duplicate)).is_err());
+        let relative = mnemo_schema::WorkspaceMap {
+            schema_version: "1.0".to_owned(),
+            mappings: BTreeMap::from([
+                (alpha.workspace_id, "relative/alpha".to_owned()),
+                (
+                    descriptors[1].workspace_id.clone(),
+                    second.canonicalize()?.to_string_lossy().into_owned(),
+                ),
+            ]),
+        };
+        assert!(super::resolve_workspace_mappings(&descriptors, Some(&relative)).is_err());
+        #[cfg(unix)]
+        {
+            let symlink = temp.path().join("workspace-link");
+            std::os::unix::fs::symlink(&first, &symlink)?;
+            let linked = mnemo_schema::WorkspaceMap {
+                schema_version: "1.0".to_owned(),
+                mappings: BTreeMap::from([
+                    (
+                        descriptors[0].workspace_id.clone(),
+                        symlink.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        descriptors[1].workspace_id.clone(),
+                        second.canonicalize()?.to_string_lossy().into_owned(),
+                    ),
+                ]),
+            };
+            assert!(super::resolve_workspace_mappings(&descriptors, Some(&linked)).is_err());
+        }
+        assert!(super::resolve_workspace_mappings(&descriptors, None).is_err());
         Ok(())
     }
 }

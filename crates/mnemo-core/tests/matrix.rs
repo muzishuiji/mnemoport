@@ -1,8 +1,12 @@
 //! Cross-platform and cross-device Core Tier migration matrix.
 
 use ed25519_dalek::SigningKey;
-use mnemo_adapter_common::{CollectionMode, ExtractedAsset};
-use mnemo_schema::{AssetKind, Entrypoint, EvidenceLevel, Platform, ProductTuple};
+use mnemo_adapter_common::{CanonicalAssetInput, CollectionMode, ExtractedAsset, make_asset};
+use mnemo_schema::{
+    AssetKind, AssetPayload, Entrypoint, EvidenceLevel, Platform, ProductTuple, ScopeLevel,
+    Sensitivity,
+};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[test]
@@ -27,6 +31,7 @@ fn all_sixteen_core_directions_survive_cross_device_package()
                 product_config: destination_root.join("product-config"),
                 user_home: destination_root.join("home"),
                 workspace: destination_root.join("workspace"),
+                workspace_mappings: std::collections::BTreeMap::new(),
             };
             let prepared =
                 mnemo_core::prepare_migration(target_tuple(target), &roots, &transported)?;
@@ -57,6 +62,72 @@ fn all_sixteen_core_directions_survive_cross_device_package()
                 target.as_str()
             );
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_target_keeps_two_portable_workspaces_separate() -> Result<(), Box<dyn std::error::Error>> {
+    let alpha = mnemo_core::workspace_descriptor("alpha")?;
+    let beta = mnemo_core::workspace_descriptor("beta")?;
+    let assets = [(&alpha, "alpha body\n"), (&beta, "beta body\n")]
+        .into_iter()
+        .map(|(descriptor, body)| {
+            let content_hash = mnemo_security::sha256_id(body.as_bytes());
+            Ok(ExtractedAsset {
+                asset: make_asset(CanonicalAssetInput {
+                    platform: Platform::Qoder,
+                    kind: AssetKind::Instruction,
+                    scope: ScopeLevel::Workspace,
+                    title: "AGENTS.md".to_owned(),
+                    locator: "AGENTS.md".to_owned(),
+                    payload: AssetPayload::Text(body.to_owned()),
+                    source_hash: content_hash.clone(),
+                    content_hash: content_hash.clone(),
+                    sensitivity: Sensitivity::Private,
+                    workspace_id: Some(descriptor.workspace_id.clone()),
+                })?,
+                objects: BTreeMap::from([(content_hash, body.as_bytes().to_vec())]),
+            })
+        })
+        .collect::<Result<Vec<_>, mnemo_adapter_common::AdapterError>>()?;
+    let package = mnemo_core::package_assets_with_workspaces(
+        &assets,
+        &[alpha.clone(), beta.clone()],
+        &SigningKey::from_bytes(&[42; 32]),
+    )?;
+    let transported = mnemo_core::unpack_bundle(&mnemo_package::verify(&package.bytes)?)?;
+
+    for target in Platform::all() {
+        let destination = tempfile::tempdir()?;
+        let root = destination.path().canonicalize()?;
+        let alpha_root = root.join("alpha");
+        let beta_root = root.join("beta");
+        std::fs::create_dir_all(&alpha_root)?;
+        std::fs::create_dir_all(&beta_root)?;
+        let roots = mnemo_core::TargetRoots {
+            product_config: root.join("config"),
+            user_home: root.join("home"),
+            workspace: root.join("legacy-workspace"),
+            workspace_mappings: BTreeMap::from([
+                (alpha.workspace_id.clone(), alpha_root.clone()),
+                (beta.workspace_id.clone(), beta_root.clone()),
+            ]),
+        };
+        let prepared =
+            mnemo_core::prepare_migration(target_tuple(target), &roots, &transported.assets)?;
+        assert_eq!(prepared.files.len(), 2, "target {}", target.as_str());
+        assert!(prepared.files.iter().any(|file| {
+            file.workspace_id.as_deref() == Some(alpha.workspace_id.as_str())
+                && file.target_path.starts_with(&alpha_root)
+                && String::from_utf8_lossy(&file.bytes).contains("alpha body")
+        }));
+        assert!(prepared.files.iter().any(|file| {
+            file.workspace_id.as_deref() == Some(beta.workspace_id.as_str())
+                && file.target_path.starts_with(&beta_root)
+                && String::from_utf8_lossy(&file.bytes).contains("beta body")
+        }));
+        assert_eq!(prepared.plan.workspace_mappings.len(), 2);
     }
     Ok(())
 }

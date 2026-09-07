@@ -50,7 +50,8 @@
           "enum": ["documented", "observed", "probe", "official_interface", "excluded"]
         },
         "source_hash": { "$ref": "#/$defs/hash" },
-        "model_inferred": { "type": "boolean" }
+        "model_inferred": { "type": "boolean" },
+        "workspace_id": { "$ref": "#/$defs/hash" }
       }
     },
     "payload": {

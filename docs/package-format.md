@@ -7,6 +7,7 @@ manifest.json
 signature.ed25519
 objects/assets/<asset-id>.json
 objects/blobs/sha256/<digest>
+objects/workspaces/<workspace-id>.json   # only for explicit multi-workspace exports
 ```
 
 `manifest.json` contains the format/minimum-reader versions, required and optional features, a content-derived package id, ordered object path/hash/size descriptors, the object-tree root hash, and the Ed25519 public key. `signature.ed25519` authenticates the exact canonical manifest bytes. Tar owners and timestamps are normalized, entries are bytewise ordered, and the package id contains no random UUID, so identical assets signed by the same key produce identical plaintext package bytes.
@@ -18,3 +19,7 @@ Encryption is intentionally outside the signature envelope: decryption yields a 
 For cross-device migration, native X25519 recipient encryption is preferred: the destination generates and retains the private identity, while the source sees only its `age1...` public recipient. Passphrase encryption remains available for workflows that already have a suitable secret channel. Private identities and passphrases are never stored in the package or ledger.
 
 The current reader limit is 100,000 entries and 512 MiB uncompressed data. Unsupported required features fail closed.
+
+Packages created with one or more explicit `--workspace LABEL=PATH` selections declare the required feature `portable-workspaces`. Each workspace object contains only schema version, a user-selected label, a label-derived SHA-256 identity, and optional credential-free Git fingerprints. It never contains the source root path. Workspace/project assets carry that identity in provenance, so identical relative paths from different roots remain distinct.
+
+Destination paths are deliberately not package objects. They live in a target-local Workspace Map and are copied into the immutable migration plan. A reader rejects missing descriptors, unknown asset references, descriptor path/id mismatches, and workspace objects that omit the required package feature.

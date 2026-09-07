@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mnemoport.io/schemas/workspace-map.schema.json",
+  "title": "MnemoPort Target Workspace Map",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "mappings"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "mappings": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^sha256:[a-f0-9]{64}$" },
+      "additionalProperties": { "type": "string", "minLength": 1 }
+    }
+  }
+}

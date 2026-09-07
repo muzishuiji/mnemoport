@@ -53,7 +53,7 @@ mnemo --version
 
 The other archives are `mnemoport-aarch64-apple-darwin.tar.gz` for Apple Silicon macOS and `mnemoport-x86_64-pc-windows-msvc.zip` for Windows x86-64. Verify the checksum before extracting, then place `mnemo` or `mnemo.exe` in a directory on `PATH`. See [release security](docs/release-security.md) to verify GitHub provenance.
 
-The recipient-encryption and trust-lifecycle commands documented below are implemented on `main` after `v0.1.0-alpha.1`; install from source until they appear in the next prerelease.
+The recipient-encryption, trust-lifecycle, and explicit multi-workspace commands documented below are implemented on `main` after `v0.1.0-alpha.1`; install from source until they appear in the next prerelease.
 
 ## Install the CLI from source
 
@@ -196,6 +196,28 @@ Changing `--to qoder` to another supported host makes this a cross-device X→Y 
 
 As an alternative, omit `--recipient` and set the same 12+ character `MNEMOPORT_PASSPHRASE` on both devices. The passphrase is never stored in the package. Recipient and plaintext modes are mutually exclusive.
 
+### Multiple workspaces in one package
+
+For a multi-root IDE or several repositories, repeat `--workspace LABEL=PATH` during inventory/export. The package contains stable labels and ids, never source absolute paths:
+
+```bash
+mnemo inventory --from cursor --workspace frontend=./frontend --workspace backend=./backend --json
+mnemo export --from cursor --workspace frontend=./frontend --workspace backend=./backend \
+  --output workspaces.mnemo --recipient 'age1...' --json
+```
+
+On the destination, run `inspect`, create a target-local JSON map from each returned `workspace_id` to a distinct existing absolute directory, and pass it only when planning:
+
+```bash
+mnemo inspect workspaces.mnemo --json
+mnemo plan --input workspaces.mnemo --to codex --workspace-map workspace-map.json \
+  --output migration-plan.json --json
+mnemo apply --input workspaces.mnemo --plan migration-plan.json --approve <approval-token> --json
+mnemo verify --input workspaces.mnemo --plan migration-plan.json --json
+```
+
+The canonical map is bound into the immutable plan; apply and verify revalidate it from that plan. Missing/extra ids, relative or duplicate targets, unavailable directories, and leaf symlinks are rejected before writes. See [portable workspace mapping](docs/workspace-mapping.md) for the map schema, invariants, and current L1 boundary.
+
 ### Signing trust lifecycle
 
 Trust is local to the destination and separate from encryption. Verify a new source fingerprint through a trusted channel before `trust add`. If a source device is retired or lost, revoke its exact full fingerprint; prefixes are rejected:
@@ -280,10 +302,10 @@ For recipient encryption, replace the environment variable with `--recipient 'ag
 | `mnemo doctor [--json]` | No | Resolve MnemoPort state and detected product tuples |
 | `mnemo detect [--platform HOST] [--json]` | No | Detect one or all supported hosts without launching them |
 | `mnemo probe [--platform HOST] [--json]` | Disposable probe state only | Run bounded, version-level L1 probes for safe entrypoints |
-| `mnemo inventory --from HOST` | No | List supported assets and manual-only candidates without bodies |
-| `mnemo export --from HOST --output FILE` | No | Extract, redact/quarantine, sign, compress, and encrypt a new package |
+| `mnemo inventory --from HOST [--workspace LABEL=PATH]` | No | List supported assets and manual-only candidates without bodies |
+| `mnemo export --from HOST --output FILE [--workspace LABEL=PATH]` | No | Extract, redact/quarantine, sign, compress, and encrypt a new package |
 | `mnemo inspect FILE` | No | Decrypt, verify, and summarize a package |
-| `mnemo plan --input FILE --to HOST --output PLAN` | No | Create a new immutable plan against the current target |
+| `mnemo plan --input FILE --to HOST --output PLAN [--workspace-map MAP]` | No | Create a new immutable plan against the current target |
 | `mnemo trust add --input FILE` | MnemoPort state only | Trust the verified signing identity of one source device |
 | `mnemo trust list` | No | List locally trusted signer fingerprints |
 | `mnemo trust revoke FINGERPRINT` | MnemoPort state only | Revoke exactly one full signer fingerprint |
@@ -333,6 +355,7 @@ Overrides select roots; they do not expand the asset allowlist. Run `mnemo docto
 - Source inventory and extraction are read-only and never launch the source product.
 - `.mnemo` content is deterministic, zstd-compressed, Ed25519-signed, and age-encrypted by default.
 - Paths, symlinks, archive sizes, signatures, hashes, object closure, and target preconditions are verified.
+- Explicit source workspace paths stay local; exact target mappings are validated and bound into the plan identity.
 - Apply uses synced local backups, durable journals, and an atomic SQLite transaction/ownership update, with strong rollback for local files.
 - Existing unrelated target content is preserved; conflicts are never silently overwritten.
 - Authentication values, cookies, keychains, internal databases, trust decisions, and caches do not migrate.
@@ -373,6 +396,7 @@ CI runs formatting, Clippy, and the full test suite on Linux, macOS, and Windows
 - [Compatibility and exact product boundaries](docs/compatibility.md)
 - [Machine-readable compatibility evidence](docs/compatibility.json)
 - [Package format](docs/package-format.md)
+- [Portable workspace mapping](docs/workspace-mapping.md)
 - [Product probes and evidence boundary](docs/product-probes.md)
 - [Release and supply-chain security](docs/release-security.md)
 - [Security policy](SECURITY.md)

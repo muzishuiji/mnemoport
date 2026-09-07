@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use mnemo_adapter_common::CollectionMode;
 use mnemo_schema::{
     AssetProbe, AssetProbeStatus, CommandResponse, Diagnostic, MigrationPlan, PlanOperationKind,
-    Platform, ProbeStatus,
+    Platform, ProbeStatus, WorkspaceDescriptor, WorkspaceMap,
 };
 use mnemo_store::{Ledger, OperationStatus};
 use serde::Serialize;
@@ -61,6 +61,9 @@ enum Command {
         /// Host that invoked MnemoPort; recorded explicitly to prevent host ambiguity.
         #[arg(long, value_parser = parse_platform)]
         invoked_by: Option<Platform>,
+        /// Explicit source workspace; repeat as LABEL=PATH for multi-root export.
+        #[arg(long = "workspace", value_name = "LABEL=PATH")]
+        workspaces: Vec<String>,
         /// Emit the stable JSON response envelope.
         #[arg(long)]
         json: bool,
@@ -73,6 +76,9 @@ enum Command {
         /// Host that invoked MnemoPort; it may differ from the source platform.
         #[arg(long, value_parser = parse_platform)]
         invoked_by: Option<Platform>,
+        /// Explicit source workspace; repeat as LABEL=PATH for multi-root export.
+        #[arg(long = "workspace", value_name = "LABEL=PATH")]
+        workspaces: Vec<String>,
         /// New package path. Existing files are never overwritten.
         #[arg(long)]
         output: PathBuf,
@@ -108,6 +114,9 @@ enum Command {
         /// New plan JSON path.
         #[arg(long)]
         output: PathBuf,
+        /// Target-local JSON mapping required by packages with explicit workspaces.
+        #[arg(long, value_name = "PATH")]
+        workspace_map: Option<PathBuf>,
         /// Emit the stable JSON response envelope.
         #[arg(long)]
         json: bool,
@@ -348,6 +357,7 @@ struct ExportReport {
     encrypted: bool,
     encryption: &'static str,
     signer_fingerprint: String,
+    workspaces: Vec<WorkspaceDescriptor>,
 }
 
 #[derive(Debug, Serialize)]
@@ -370,6 +380,7 @@ struct InspectReport {
     object_count: usize,
     signer_fingerprint: String,
     encrypted: bool,
+    workspaces: Vec<WorkspaceDescriptor>,
 }
 
 #[derive(Debug, Serialize)]
@@ -496,10 +507,16 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Inventory {
             from,
             invoked_by: _,
+            workspaces,
             json,
         } => {
-            let inventory = mnemo_core::inventory(from, CollectionMode::OfflineStatic)
-                .context("inventory failed")?;
+            let inventory = if workspaces.is_empty() {
+                mnemo_core::inventory(from, CollectionMode::OfflineStatic)
+            } else {
+                let sources = parse_workspace_sources(&workspaces)?;
+                mnemo_core::inventory_workspaces(from, CollectionMode::OfflineStatic, &sources)
+            }
+            .context("inventory failed")?;
             if inventory.iter().any(|item| item.requires_assisted) {
                 outcome = 2;
             }
@@ -508,13 +525,24 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Export {
             from,
             invoked_by: _,
+            workspaces,
             output,
             allow_plaintext,
             recipient,
             json,
         } => {
-            let assets = mnemo_core::extract(from, CollectionMode::OfflineStatic)
-                .context("asset extraction failed")?;
+            let bundle = if workspaces.is_empty() {
+                mnemo_core::MigrationBundle {
+                    assets: mnemo_core::extract(from, CollectionMode::OfflineStatic)
+                        .context("asset extraction failed")?,
+                    workspaces: Vec::new(),
+                }
+            } else {
+                let sources = parse_workspace_sources(&workspaces)?;
+                mnemo_core::extract_workspaces(from, CollectionMode::OfflineStatic, &sources)
+                    .context("asset extraction failed")?
+            };
+            let assets = &bundle.assets;
             let quarantined_assets = assets
                 .iter()
                 .filter(|asset| asset.asset.sensitivity == mnemo_schema::Sensitivity::Quarantined)
@@ -525,7 +553,8 @@ fn run(cli: Cli) -> Result<u8> {
             let state = mnemo_store::resolve_state_paths().context("state paths unavailable")?;
             let key = mnemo_store::load_or_create_signing_key(&state.data)
                 .context("device signing identity unavailable")?;
-            let package = mnemo_core::package_assets(&assets, &key)?;
+            let package =
+                mnemo_core::package_assets_with_workspaces(assets, &bundle.workspaces, &key)?;
             let (bytes, encryption) =
                 seal_package(&package.bytes, allow_plaintext, recipient.as_deref())?;
             write_new_private(&output, &bytes)?;
@@ -539,21 +568,23 @@ fn run(cli: Cli) -> Result<u8> {
                 signer_fingerprint: mnemo_core::signer_fingerprint(
                     &package.manifest.signer_public_key,
                 ),
+                workspaces: bundle.workspaces,
             };
             emit(json, "export", report)?;
         }
         Command::Inspect { input, json } => {
             let (verified, encrypted) = open_package(&input, identity.as_deref())?;
-            let assets = mnemo_core::unpack_assets(&verified)?;
+            let bundle = mnemo_core::unpack_bundle(&verified)?;
             let report = InspectReport {
                 package_id: verified.manifest.package_id.clone(),
                 format_version: verified.manifest.header.format_version.clone(),
-                assets: assets.len(),
+                assets: bundle.assets.len(),
                 object_count: verified.manifest.objects.len(),
                 signer_fingerprint: mnemo_core::signer_fingerprint(
                     &verified.manifest.signer_public_key,
                 ),
                 encrypted,
+                workspaces: bundle.workspaces,
             };
             emit(json, "inspect", report)?;
         }
@@ -562,14 +593,18 @@ fn run(cli: Cli) -> Result<u8> {
             to,
             invoked_by,
             output,
+            workspace_map,
             json,
         } => {
             validate_target_host(invoked_by, to)?;
             let (verified, _) = open_package(&input, identity.as_deref())?;
-            let assets = mnemo_core::unpack_assets(&verified)?;
+            let bundle = mnemo_core::unpack_bundle(&verified)?;
             let workspace = std::env::current_dir()?;
-            let (target, roots) = mnemo_core::resolve_target_roots(to, &workspace)?;
-            let prepared = prepare_with_ownership(target, &roots, &assets)?;
+            let (target, mut roots) = mnemo_core::resolve_target_roots(to, &workspace)?;
+            let map = read_workspace_map(workspace_map.as_deref())?;
+            roots.workspace_mappings =
+                mnemo_core::resolve_workspace_mappings(&bundle.workspaces, map.as_ref())?;
+            let prepared = prepare_with_ownership(target, &roots, &bundle.assets)?;
             if !prepared.skipped.is_empty()
                 || prepared
                     .plan
@@ -604,17 +639,19 @@ fn run(cli: Cli) -> Result<u8> {
                 &fs::read(&plan).with_context(|| format!("cannot read {}", plan.display()))?,
             )
             .context("invalid migration plan JSON")?;
+            validate_plan_identity(&saved)?;
             if approve != approval_token(&saved.plan_id) {
                 anyhow::bail!("approval token does not match this plan");
             }
             validate_target_host(invoked_by, saved.target.platform)?;
             let (verified, _) = open_package(&input, identity.as_deref())?;
             require_trusted_signer(&verified.manifest.signer_public_key)?;
-            let assets = mnemo_core::unpack_assets(&verified)?;
+            let bundle = mnemo_core::unpack_bundle(&verified)?;
             let workspace = std::env::current_dir()?;
-            let (target, roots) =
+            let (target, mut roots) =
                 mnemo_core::resolve_target_roots(saved.target.platform, &workspace)?;
-            let prepared = prepare_with_ownership(target, &roots, &assets)?;
+            roots.workspace_mappings = workspace_mappings_from_plan(&bundle.workspaces, &saved)?;
+            let prepared = prepare_with_ownership(target, &roots, &bundle.assets)?;
             if prepared.plan != saved {
                 anyhow::bail!(
                     "target or package drifted after planning; discard the plan and run mnemo plan again"
@@ -800,6 +837,7 @@ fn run(cli: Cli) -> Result<u8> {
                     signer_fingerprint: mnemo_core::signer_fingerprint(
                         &package.manifest.signer_public_key,
                     ),
+                    workspaces: Vec::new(),
                 },
             )?;
         }
@@ -828,6 +866,53 @@ fn command_phase(command: &Command) -> &'static str {
     }
 }
 
+fn parse_workspace_sources(specifications: &[String]) -> Result<Vec<mnemo_core::WorkspaceSource>> {
+    specifications
+        .iter()
+        .map(|specification| {
+            let (label, raw_path) = specification.split_once('=').with_context(|| {
+                format!("invalid workspace selection {specification:?}; expected LABEL=PATH")
+            })?;
+            let descriptor = mnemo_core::workspace_descriptor(label)?;
+            let path = fs::canonicalize(raw_path).with_context(|| {
+                format!("invalid workspace selection for {label}: source is unavailable")
+            })?;
+            if !path.is_dir() {
+                anyhow::bail!(
+                    "invalid workspace selection for {label}: source must be a directory"
+                );
+            }
+            Ok(mnemo_core::WorkspaceSource { descriptor, path })
+        })
+        .collect()
+}
+
+fn read_workspace_map(path: Option<&Path>) -> Result<Option<WorkspaceMap>> {
+    path.map(|path| {
+        serde_json::from_slice(
+            &fs::read(path)
+                .with_context(|| format!("cannot read workspace map {}", path.display()))?,
+        )
+        .context("invalid workspace map JSON")
+    })
+    .transpose()
+}
+
+fn workspace_mappings_from_plan(
+    descriptors: &[WorkspaceDescriptor],
+    plan: &MigrationPlan,
+) -> Result<BTreeMap<String, PathBuf>> {
+    let workspace_map = WorkspaceMap {
+        schema_version: "1.0".to_owned(),
+        mappings: plan.workspace_mappings.clone(),
+    };
+    let selected = (!plan.workspace_mappings.is_empty()).then_some(&workspace_map);
+    Ok(mnemo_core::resolve_workspace_mappings(
+        descriptors,
+        selected,
+    )?)
+}
+
 fn verify_migration(
     input: &Path,
     plan: &Path,
@@ -838,17 +923,13 @@ fn verify_migration(
         &fs::read(plan).with_context(|| format!("cannot read {}", plan.display()))?,
     )
     .context("invalid migration plan JSON")?;
-    let mut identity = saved.clone();
-    identity.plan_id.clear();
-    let expected_plan_id = mnemo_security::sha256_id(&serde_json::to_vec(&identity)?);
-    if expected_plan_id != saved.plan_id {
-        anyhow::bail!("invalid migration plan identity");
-    }
+    validate_plan_identity(&saved)?;
     let (verified, _) = open_package(input, identity_path)?;
-    let assets = mnemo_core::unpack_assets(&verified)?;
+    let bundle = mnemo_core::unpack_bundle(&verified)?;
     let workspace = std::env::current_dir()?;
-    let (target, roots) = mnemo_core::resolve_target_roots(saved.target.platform, &workspace)?;
-    let prepared = prepare_with_ownership(target.clone(), &roots, &assets)?;
+    let (target, mut roots) = mnemo_core::resolve_target_roots(saved.target.platform, &workspace)?;
+    roots.workspace_mappings = workspace_mappings_from_plan(&bundle.workspaces, &saved)?;
+    let prepared = prepare_with_ownership(target.clone(), &roots, &bundle.assets)?;
     if prepared.plan.source_root_hash != saved.source_root_hash
         || prepared.plan.target != saved.target
         || prepared.plan.adapter_version != saved.adapter_version
@@ -871,7 +952,7 @@ fn verify_migration(
         false
     };
     let asset_discovery = if level == VerifyLevel::L1 {
-        mnemo_core::verify_asset_discovery(&target, &roots, &assets, &prepared)?
+        mnemo_core::verify_asset_discovery(&target, &roots, &bundle.assets, &prepared)?
     } else {
         Vec::new()
     };
@@ -888,6 +969,16 @@ fn verify_migration(
         },
         asset_discovery,
     })
+}
+
+fn validate_plan_identity(saved: &MigrationPlan) -> Result<()> {
+    let mut identity = saved.clone();
+    identity.plan_id.clear();
+    let expected_plan_id = mnemo_security::sha256_id(&serde_json::to_vec(&identity)?);
+    if expected_plan_id != saved.plan_id {
+        anyhow::bail!("invalid migration plan identity");
+    }
+    Ok(())
 }
 
 fn prepare_with_ownership(

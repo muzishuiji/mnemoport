@@ -55,6 +55,9 @@ pub struct InventoryItem {
     pub size: Option<u64>,
     /// Whether content collection requires assisted mode.
     pub requires_assisted: bool,
+    /// Portable workspace identity when explicitly collecting multiple roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 /// Canonical metadata plus content-addressed object bytes collected from a
@@ -489,11 +492,25 @@ pub trait PlatformAdapter: Send + Sync {
     }
     /// Return metadata only. M0 adapters may return an empty inventory.
     fn inventory(&self, mode: CollectionMode) -> Result<Vec<InventoryItem>, AdapterError>;
+    /// Return metadata for one explicitly selected workspace without changing
+    /// the process current directory.
+    fn inventory_at(
+        &self,
+        mode: CollectionMode,
+        workspace: &Path,
+    ) -> Result<Vec<InventoryItem>, AdapterError>;
     /// Extract supported canonical assets. Unsupported categories must remain
     /// visible in inventory rather than being guessed here.
     fn extract(&self, _mode: CollectionMode) -> Result<Vec<ExtractedAsset>, AdapterError> {
         Ok(Vec::new())
     }
+    /// Extract supported assets for one explicit workspace without changing
+    /// the process current directory.
+    fn extract_at(
+        &self,
+        mode: CollectionMode,
+        workspace: &Path,
+    ) -> Result<Vec<ExtractedAsset>, AdapterError>;
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -800,6 +817,7 @@ pub fn inventory_file(
         locator,
         size: Some(metadata.len()),
         requires_assisted: false,
+        workspace_id: None,
     })
 }
 
@@ -838,6 +856,7 @@ pub fn extract_text(
         source_hash: sha256_id(&source),
         content_hash: content_hash.clone(),
         sensitivity,
+        workspace_id: None,
     })?;
     Ok(ExtractedAsset {
         asset,
@@ -917,6 +936,7 @@ pub fn extract_file_tree(
         } else {
             Sensitivity::Private
         },
+        workspace_id: None,
     })?;
     Ok(ExtractedAsset { asset, objects })
 }
@@ -1065,6 +1085,7 @@ pub fn collect_skills(
             locator,
             size: Some(size),
             requires_assisted: false,
+            workspace_id: None,
         });
         let title = entry.file_name().to_string_lossy().into_owned();
         extracted.push(extract_file_tree(
@@ -1336,6 +1357,7 @@ fn append_mcp_asset(
         } else {
             Sensitivity::SecretReference
         },
+        workspace_id: None,
     })?;
     inventory.push(InventoryItem {
         id: asset.asset_id.clone(),
@@ -1344,6 +1366,7 @@ fn append_mcp_asset(
         locator: locator.to_owned(),
         size: None,
         requires_assisted: false,
+        workspace_id: None,
     });
     extracted.push(ExtractedAsset {
         asset,
@@ -1406,18 +1429,35 @@ pub struct CanonicalAssetInput {
     pub content_hash: String,
     /// Privacy/execution classification.
     pub sensitivity: Sensitivity,
+    /// Portable workspace identity for workspace/project-scoped assets.
+    pub workspace_id: Option<String>,
 }
 
 /// Construct a canonical asset id from validated parts.
 pub fn make_asset(input: CanonicalAssetInput) -> Result<CanonicalAsset, AdapterError> {
-    let identity = serde_json::to_vec(&(
-        input.platform,
-        input.kind,
-        input.scope,
-        &input.title,
-        &input.locator,
-        &input.content_hash,
-    ))
+    let identity = if let Some(workspace_id) = input.workspace_id.as_deref() {
+        serde_json::to_vec(&(
+            input.platform,
+            input.kind,
+            input.scope,
+            &input.title,
+            &input.locator,
+            &input.content_hash,
+            "portable-workspace-v1",
+            workspace_id,
+        ))
+    } else {
+        // Preserve the v1 identity material byte-for-byte so packages created
+        // before portable workspaces remain readable.
+        serde_json::to_vec(&(
+            input.platform,
+            input.kind,
+            input.scope,
+            &input.title,
+            &input.locator,
+            &input.content_hash,
+        ))
+    }
     .map_err(|error| AdapterError::InvalidData {
         path: PathBuf::from(&input.locator),
         message: error.to_string(),
@@ -1436,6 +1476,7 @@ pub fn make_asset(input: CanonicalAssetInput) -> Result<CanonicalAsset, AdapterE
             evidence: EvidenceLevel::Documented,
             source_hash: input.source_hash,
             model_inferred: false,
+            workspace_id: input.workspace_id,
         },
         payload: input.payload,
     })
@@ -1602,9 +1643,43 @@ mod tests {
     #[cfg(unix)]
     use super::probe_version_with_timeout;
     use super::{
-        ExtractedAsset, collect_json_mcp_if_present, collect_toml_mcp_if_present, extract_version,
-        merge_mcp_json, merge_mcp_toml, probe_version,
+        CanonicalAssetInput, ExtractedAsset, collect_json_mcp_if_present,
+        collect_toml_mcp_if_present, extract_version, make_asset, merge_mcp_json, merge_mcp_toml,
+        probe_version,
     };
+
+    #[test]
+    fn absent_workspace_id_preserves_the_original_v1_asset_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let platform = Platform::Codex;
+        let kind = mnemo_schema::AssetKind::Instruction;
+        let scope = ScopeLevel::Workspace;
+        let title = "AGENTS.md".to_owned();
+        let locator = "AGENTS.md".to_owned();
+        let content_hash = mnemo_security::sha256_id(b"portable\n");
+        let legacy_material =
+            serde_json::to_vec(&(platform, kind, scope, &title, &locator, &content_hash))?;
+        let expected = mnemo_security::sha256_id(&legacy_material);
+        let asset = make_asset(CanonicalAssetInput {
+            platform,
+            kind,
+            scope,
+            title,
+            locator,
+            payload: AssetPayload::Text("portable\n".to_owned()),
+            source_hash: content_hash.clone(),
+            content_hash,
+            sensitivity: Sensitivity::Private,
+            workspace_id: None,
+        })?;
+        assert_eq!(asset.asset_id, expected);
+        assert!(
+            serde_json::to_value(&asset)?["provenance"]
+                .get("workspace_id")
+                .is_none()
+        );
+        Ok(())
+    }
     use mnemo_schema::{
         AssetPayload, Entrypoint, EvidenceLevel, Platform, ProbeStatus, ProductTuple, ScopeLevel,
         Sensitivity,

@@ -29,17 +29,33 @@ impl PlatformAdapter for CodexAdapter {
     }
 
     fn inventory(&self, mode: CollectionMode) -> Result<Vec<InventoryItem>, AdapterError> {
+        let workspace = current_directory()?;
+        self.inventory_at(mode, &workspace)
+    }
+
+    fn inventory_at(
+        &self,
+        mode: CollectionMode,
+        workspace: &Path,
+    ) -> Result<Vec<InventoryItem>, AdapterError> {
         let codex_root = resolve_root("CODEX_HOME", ".codex")?.path;
         let home = user_home()?;
-        let workspace = current_directory()?;
-        Ok(collect_from_roots(&codex_root, &home, &workspace, mode)?.inventory)
+        Ok(collect_from_roots(&codex_root, &home, workspace, mode)?.inventory)
     }
 
     fn extract(&self, mode: CollectionMode) -> Result<Vec<ExtractedAsset>, AdapterError> {
+        let workspace = current_directory()?;
+        self.extract_at(mode, &workspace)
+    }
+
+    fn extract_at(
+        &self,
+        mode: CollectionMode,
+        workspace: &Path,
+    ) -> Result<Vec<ExtractedAsset>, AdapterError> {
         let codex_root = resolve_root("CODEX_HOME", ".codex")?.path;
         let home = user_home()?;
-        let workspace = current_directory()?;
-        Ok(collect_from_roots(&codex_root, &home, &workspace, mode)?.extracted)
+        Ok(collect_from_roots(&codex_root, &home, workspace, mode)?.extracted)
     }
 }
 

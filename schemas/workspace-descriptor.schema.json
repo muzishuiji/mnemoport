@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mnemoport.io/schemas/workspace-descriptor.schema.json",
+  "title": "MnemoPort Workspace Descriptor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "workspace_id", "label"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "workspace_id": { "$ref": "#/$defs/hash" },
+    "label": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "git_remote_hash": { "$ref": "#/$defs/hash" },
+    "git_head": { "type": "string", "minLength": 7, "maxLength": 64, "pattern": "^[a-fA-F0-9]+$" }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+  }
+}

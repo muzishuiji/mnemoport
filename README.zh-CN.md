@@ -53,7 +53,7 @@ mnemo --version
 
 其他压缩包分别是 Apple Silicon macOS 使用的 `mnemoport-aarch64-apple-darwin.tar.gz`，以及 Windows x86-64 使用的 `mnemoport-x86_64-pc-windows-msvc.zip`。解压前先验证校验和，再把 `mnemo` 或 `mnemo.exe` 放到 `PATH` 中的目录。GitHub provenance 验证方式参见[发布安全](docs/release-security.md)。
 
-下文的 recipient 公钥加密和信任生命周期命令是在 `v0.1.0-alpha.1` 之后实现于 `main` 的功能；下一版预发布前请从源码安装。
+下文的 recipient 公钥加密、信任生命周期和显式多工作区命令是在 `v0.1.0-alpha.1` 之后实现于 `main` 的功能；下一版预发布前请从源码安装。
 
 ## 从源码安装 CLI
 
@@ -196,6 +196,28 @@ mnemo verify --input qoder-assets.mnemo --plan migration-plan.json --json
 
 也可以不传 `--recipient`，改为在两台设备上设置相同的 12 字符以上 `MNEMOPORT_PASSPHRASE`。口令不会保存在包中。recipient 模式与明文模式互斥。
 
+### 一个包迁移多个工作区
+
+对于多根目录 IDE 或多个仓库，在 inventory/export 时重复传入 `--workspace LABEL=PATH`。包中只保存稳定的标签和 ID，不保存来源绝对路径：
+
+```bash
+mnemo inventory --from cursor --workspace frontend=./frontend --workspace backend=./backend --json
+mnemo export --from cursor --workspace frontend=./frontend --workspace backend=./backend \
+  --output workspaces.mnemo --recipient 'age1...' --json
+```
+
+在目标设备运行 `inspect`，根据返回的每个 `workspace_id` 创建一个本机 JSON 映射，使其分别指向不同且已存在的绝对目录；该映射只在生成计划时传入：
+
+```bash
+mnemo inspect workspaces.mnemo --json
+mnemo plan --input workspaces.mnemo --to codex --workspace-map workspace-map.json \
+  --output migration-plan.json --json
+mnemo apply --input workspaces.mnemo --plan migration-plan.json --approve <approval-token> --json
+mnemo verify --input workspaces.mnemo --plan migration-plan.json --json
+```
+
+规范化映射会绑定到不可变计划；apply 和 verify 从该计划中重新验证映射。缺少/多余 ID、相对路径、重复目标、不可用目录及末级符号链接都会在写入前被拒绝。映射 Schema、不变量和当前 L1 边界参见[可移植工作区映射](docs/workspace-mapping.md)。
+
 ### 签名信任生命周期
 
 签名信任只保存在目标设备本地，并且与包加密相互独立。执行 `trust add` 前，应通过可信渠道核对新来源设备的指纹。来源设备退役或丢失后，使用完整精确指纹撤销信任；命令拒绝指纹前缀：
@@ -280,10 +302,10 @@ mnemo handoff --input handoff.json --output handoff.mnemo --json
 | `mnemo doctor [--json]` | 否 | 解析 MnemoPort 状态路径和已检测到的产品 tuple |
 | `mnemo detect [--platform HOST] [--json]` | 否 | 在不启动产品的情况下检测一个或全部受支持宿主 |
 | `mnemo probe [--platform HOST] [--json]` | 仅一次性探测状态 | 对安全入口执行有界的版本级 L1 探测 |
-| `mnemo inventory --from HOST` | 否 | 在不包含正文的情况下列出受支持资产和仅能手动处理的候选项 |
-| `mnemo export --from HOST --output FILE` | 否 | 提取、脱敏/隔离、签名、压缩并加密新包 |
+| `mnemo inventory --from HOST [--workspace LABEL=PATH]` | 否 | 在不包含正文的情况下列出受支持资产和仅能手动处理的候选项 |
+| `mnemo export --from HOST --output FILE [--workspace LABEL=PATH]` | 否 | 提取、脱敏/隔离、签名、压缩并加密新包 |
 | `mnemo inspect FILE` | 否 | 解密、验证并汇总包内容 |
-| `mnemo plan --input FILE --to HOST --output PLAN` | 否 | 针对当前目标生成新的不可变计划 |
+| `mnemo plan --input FILE --to HOST --output PLAN [--workspace-map MAP]` | 否 | 针对当前目标生成新的不可变计划 |
 | `mnemo trust add --input FILE` | 仅 MnemoPort 状态 | 信任一个已验证的来源设备签名身份 |
 | `mnemo trust list` | 否 | 列出本机信任的签名指纹 |
 | `mnemo trust revoke FINGERPRINT` | 仅 MnemoPort 状态 | 精确撤销一个完整签名指纹 |
@@ -333,6 +355,7 @@ MnemoPort 只读取 Adapter 批准的路径以及当前 workspace。隔离测试
 - 来源盘点和提取只读，绝不启动来源产品。
 - `.mnemo` 内容具有确定性，使用 zstd 压缩、Ed25519 签名，并默认通过 age 加密。
 - 路径、符号链接、归档大小、签名、哈希、对象闭包和目标前置条件都会被验证。
+- 显式来源工作区路径只保留在本机；目标精确映射经过验证并绑定到计划身份。
 - Apply 使用已经同步到磁盘的本地备份、持久事务日志以及原子提交的 SQLite 事务/所有权更新，并为本地文件提供强回滚。
 - 保留目标中无关的已有内容；冲突绝不被静默覆盖。
 - 认证值、Cookies、系统钥匙串、内部数据库、信任决定和缓存均不迁移。
@@ -373,6 +396,7 @@ CI 会在 Linux、macOS 和 Windows 上，分别使用 Rust 1.85 与 Stable 执�
 - [兼容性与精确产品边界](docs/compatibility.md)
 - [机器可读兼容性证据](docs/compatibility.json)
 - [包格式](docs/package-format.md)
+- [可移植工作区映射](docs/workspace-mapping.md)
 - [产品探测与证据边界](docs/product-probes.md)
 - [发布与供应链安全](docs/release-security.md)
 - [安全策略](SECURITY.md)

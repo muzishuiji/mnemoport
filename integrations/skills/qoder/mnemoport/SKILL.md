@@ -1,6 +1,6 @@
 ---
 name: mnemoport
-description: Migrate, export, inspect, plan, install, or undo portable AI assets between Qoder, Codex, Claude Code, and Cursor, including same-tool cross-device moves. Use when the user asks to move or synchronize instructions, skills, prompts, preferences, or MCP definitions.
+description: Migrate, export, inspect, plan, install, or undo portable AI assets between Qoder, Codex, Claude Code, and Cursor, including same-tool, cross-device, and multi-workspace moves. Use when the user asks to move or synchronize instructions, skills, prompts, preferences, or MCP definitions.
 ---
 
 # MnemoPort for Qoder
@@ -9,8 +9,10 @@ Treat the detected Qoder CLI, Desktop, or IDE entrypoint as the current host; ne
 
 1. Run `mnemo doctor --json` and explain unavailable or unknown Qoder tuples without guessing them.
 2. For a local source, run `mnemo inventory --from <platform> --invoked-by qoder --json` first. Report every skipped/manual category; an empty result is not proof that nothing exists.
+   - When the user selects several repositories or IDE roots, choose stable non-sensitive labels and repeat `--workspace <label>=<source-path>` on both inventory and export. Do not serialize or report source absolute paths as portable metadata.
 3. For cross-device export, prefer a destination-generated public recipient: on B run `mnemo recipient generate --output <private.agekey> --json`, retain the private file only on B, and give A only the returned `age1...` value. On A export with `mnemo export --from <platform> --invoked-by qoder --output <name>.mnemo --recipient <age1...> --json`. If recipient mode is unavailable, omit it and have the user inject `MNEMOPORT_PASSPHRASE` through their terminal or secret manager. Never ask for a private age identity, passphrase, or token in chat or a command argument. Use `--allow-plaintext` only after an explicit request and warning.
 4. On target device B, select its private identity with `--identity <private.agekey>` or `MNEMOPORT_IDENTITY_FILE`, inspect first, then plan: `mnemo inspect <name>.mnemo --json`, followed by `mnemo plan --input <name>.mnemo --to qoder --invoked-by qoder --output mnemo-plan.json --json`.
+   - If `inspect` reports workspaces, create a target-local Workspace Map whose keys exactly match those ids and whose values are distinct existing absolute destination directories. Pass it to plan as `--workspace-map <map.json>`. Never guess an ambiguous destination, reuse a source path from package content, or pass another map to apply/verify; those commands use the mapping bound into the approved plan.
 5. For a new source device, show the signer fingerprint and ask whether to trust it. Only after confirmation run `mnemo trust add --input <name>.mnemo --label <device> --json`.
 6. Summarize exact writes, no-ops, conflicts, reauthentication, quarantine, and unsupported assets. Do not treat the printed approval token as permission by itself. Wait for the user to approve this displayed plan.
 7. After approval, run `mnemo apply --input <name>.mnemo --plan mnemo-plan.json --approve <token> --invoked-by qoder --json`, then `mnemo verify --input <name>.mnemo --plan mnemo-plan.json --json`. Report the migration id and L0 verification result.

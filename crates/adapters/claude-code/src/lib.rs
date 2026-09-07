@@ -30,15 +30,31 @@ impl PlatformAdapter for ClaudeCodeAdapter {
     }
 
     fn inventory(&self, mode: CollectionMode) -> Result<Vec<InventoryItem>, AdapterError> {
-        let config = resolve_root("CLAUDE_CONFIG_DIR", ".claude")?.path;
         let workspace = current_directory()?;
-        Ok(collect_from_roots(&config, &workspace, mode)?.inventory)
+        self.inventory_at(mode, &workspace)
+    }
+
+    fn inventory_at(
+        &self,
+        mode: CollectionMode,
+        workspace: &Path,
+    ) -> Result<Vec<InventoryItem>, AdapterError> {
+        let config = resolve_root("CLAUDE_CONFIG_DIR", ".claude")?.path;
+        Ok(collect_from_roots(&config, workspace, mode)?.inventory)
     }
 
     fn extract(&self, mode: CollectionMode) -> Result<Vec<ExtractedAsset>, AdapterError> {
-        let config = resolve_root("CLAUDE_CONFIG_DIR", ".claude")?.path;
         let workspace = current_directory()?;
-        Ok(collect_from_roots(&config, &workspace, mode)?.extracted)
+        self.extract_at(mode, &workspace)
+    }
+
+    fn extract_at(
+        &self,
+        mode: CollectionMode,
+        workspace: &Path,
+    ) -> Result<Vec<ExtractedAsset>, AdapterError> {
+        let config = resolve_root("CLAUDE_CONFIG_DIR", ".claude")?.path;
+        Ok(collect_from_roots(&config, workspace, mode)?.extracted)
     }
 }
 

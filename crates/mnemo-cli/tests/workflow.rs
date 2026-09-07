@@ -310,6 +310,18 @@ fn encrypted_cross_device_export_plan_apply_and_undo() -> Result<(), Box<dyn std
         ],
     )?;
     let plan_json = success_json(&planned)?;
+    assert!(
+        plan_json["data"]["plan"]
+            .get("workspace_mappings")
+            .is_none()
+    );
+    assert!(
+        plan_json["data"]["plan"]["operations"]
+            .as_array()
+            .ok_or("plan operations missing")?
+            .iter()
+            .all(|operation| operation["effect"].get("workspace_id").is_none())
+    );
     let token = plan_json["data"]["approval_token"]
         .as_str()
         .ok_or("approval token missing")?;
@@ -694,6 +706,253 @@ fn inventory_uses_partial_exit_for_manual_assets() -> Result<(), Box<dyn std::er
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn multi_workspace_package_maps_and_installs_each_root_without_source_paths()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let source_alpha = temp.path().join("source-alpha-private");
+    let source_beta = temp.path().join("source-beta-private");
+    let source_config = temp.path().join("source-codex");
+    let source_state = temp.path().join("source-state");
+    let target_alpha = temp.path().join("target-alpha");
+    let target_beta = temp.path().join("target-beta");
+    let target_config = temp.path().join("target-codex");
+    let target_state = temp.path().join("target-state");
+    for directory in [
+        &source_alpha,
+        &source_beta,
+        &source_config,
+        &target_alpha,
+        &target_beta,
+        &target_config,
+    ] {
+        std::fs::create_dir_all(directory)?;
+    }
+    let source_alpha = source_alpha.canonicalize()?;
+    let source_beta = source_beta.canonicalize()?;
+    let target_alpha = target_alpha.canonicalize()?;
+    let target_beta = target_beta.canonicalize()?;
+    std::fs::write(source_alpha.join("AGENTS.md"), "Alpha instructions.\n")?;
+    std::fs::write(source_beta.join("AGENTS.md"), "Beta instructions.\n")?;
+    std::fs::create_dir_all(source_alpha.join(".git"))?;
+    let remote_canary = "remote-password-canary-7f41";
+    std::fs::write(
+        source_alpha.join(".git/config"),
+        format!(
+            "[remote \"origin\"]\nurl = https://user:{remote_canary}@example.invalid/repo.git\n"
+        ),
+    )?;
+    let package = temp.path().join("multi.mnemo");
+    let plan = temp.path().join("multi-plan.json");
+    let alpha_spec = format!("alpha={}", source_alpha.display());
+    let beta_spec = format!("beta={}", source_beta.display());
+    let exported = success_json(&run(
+        temp.path(),
+        &source_state,
+        &[
+            "export",
+            "--from",
+            "codex",
+            "--workspace",
+            &alpha_spec,
+            "--workspace",
+            &beta_spec,
+            "--output",
+            package.to_str().ok_or("package path is not UTF-8")?,
+            "--allow-plaintext",
+            "--json",
+        ],
+        &[("CODEX_HOME", &source_config)],
+    )?)?;
+    assert_eq!(exported["data"]["assets"], 2);
+    let descriptors = exported["data"]["workspaces"]
+        .as_array()
+        .ok_or("workspace descriptors missing")?;
+    assert_eq!(descriptors.len(), 2);
+    let id_for = |label: &str| -> Result<String, Box<dyn std::error::Error>> {
+        Ok(descriptors
+            .iter()
+            .find(|descriptor| descriptor["label"] == label)
+            .and_then(|descriptor| descriptor["workspace_id"].as_str())
+            .ok_or("workspace id missing")?
+            .to_owned())
+    };
+    let alpha_id = id_for("alpha")?;
+    let beta_id = id_for("beta")?;
+
+    let verified_package = mnemo_package::verify(&std::fs::read(&package)?)?;
+    assert!(
+        verified_package
+            .manifest
+            .header
+            .required_features
+            .contains(&"portable-workspaces".to_owned())
+    );
+    for bytes in verified_package.objects.values() {
+        let body = String::from_utf8_lossy(bytes);
+        assert!(!body.contains(source_alpha.to_string_lossy().as_ref()));
+        assert!(!body.contains(source_beta.to_string_lossy().as_ref()));
+        assert!(!body.contains(remote_canary));
+    }
+
+    let missing_map = run(
+        temp.path(),
+        &target_state,
+        &[
+            "plan",
+            "--input",
+            package.to_str().ok_or("package path is not UTF-8")?,
+            "--to",
+            "codex",
+            "--output",
+            plan.to_str().ok_or("plan path is not UTF-8")?,
+            "--json",
+        ],
+        &[("CODEX_HOME", &target_config)],
+    )?;
+    assert_eq!(missing_map.status.code(), Some(6));
+
+    let workspace_map = temp.path().join("workspace-map.json");
+    std::fs::write(
+        &workspace_map,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": "1.0",
+            "mappings": {
+                alpha_id.clone(): target_alpha.to_string_lossy(),
+                beta_id.clone(): target_beta.to_string_lossy()
+            }
+        }))?,
+    )?;
+    let planned = success_json(&run(
+        temp.path(),
+        &target_state,
+        &[
+            "plan",
+            "--input",
+            package.to_str().ok_or("package path is not UTF-8")?,
+            "--to",
+            "codex",
+            "--workspace-map",
+            workspace_map.to_str().ok_or("map path is not UTF-8")?,
+            "--output",
+            plan.to_str().ok_or("plan path is not UTF-8")?,
+            "--json",
+        ],
+        &[("CODEX_HOME", &target_config)],
+    )?)?;
+    assert_eq!(
+        planned["data"]["plan"]["workspace_mappings"][&alpha_id],
+        target_alpha.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        planned["data"]["plan"]["workspace_mappings"][&beta_id],
+        target_beta.to_string_lossy().as_ref()
+    );
+    let token = planned["data"]["approval_token"]
+        .as_str()
+        .ok_or("approval token missing")?;
+
+    success_json(&run(
+        temp.path(),
+        &target_state,
+        &[
+            "trust",
+            "add",
+            "--input",
+            package.to_str().ok_or("package path is not UTF-8")?,
+            "--json",
+        ],
+        &[],
+    )?)?;
+    let tampered_plan = temp.path().join("tampered-plan.json");
+    let mut tampered: Value = serde_json::from_slice(&std::fs::read(&plan)?)?;
+    tampered["workspace_mappings"][&alpha_id] =
+        Value::String(target_beta.to_string_lossy().into_owned());
+    std::fs::write(&tampered_plan, serde_json::to_vec_pretty(&tampered)?)?;
+    let rejected_tamper = run(
+        temp.path(),
+        &target_state,
+        &[
+            "apply",
+            "--input",
+            package.to_str().ok_or("package path is not UTF-8")?,
+            "--plan",
+            tampered_plan
+                .to_str()
+                .ok_or("tampered plan path is not UTF-8")?,
+            "--approve",
+            token,
+            "--json",
+        ],
+        &[("CODEX_HOME", &target_config)],
+    )?;
+    assert_eq!(rejected_tamper.status.code(), Some(6));
+    assert!(!target_alpha.join("AGENTS.md").exists());
+    assert!(!target_beta.join("AGENTS.md").exists());
+    std::fs::write(target_alpha.join("AGENTS.md"), "External target edit.\n")?;
+    let drifted = run(
+        temp.path(),
+        &target_state,
+        &[
+            "apply",
+            "--input",
+            package.to_str().ok_or("package path is not UTF-8")?,
+            "--plan",
+            plan.to_str().ok_or("plan path is not UTF-8")?,
+            "--approve",
+            token,
+            "--json",
+        ],
+        &[("CODEX_HOME", &target_config)],
+    )?;
+    assert_eq!(drifted.status.code(), Some(3));
+    assert_eq!(
+        std::fs::read_to_string(target_alpha.join("AGENTS.md"))?,
+        "External target edit.\n"
+    );
+    assert!(!target_beta.join("AGENTS.md").exists());
+    std::fs::remove_file(target_alpha.join("AGENTS.md"))?;
+    success_json(&run(
+        temp.path(),
+        &target_state,
+        &[
+            "apply",
+            "--input",
+            package.to_str().ok_or("package path is not UTF-8")?,
+            "--plan",
+            plan.to_str().ok_or("plan path is not UTF-8")?,
+            "--approve",
+            token,
+            "--json",
+        ],
+        &[("CODEX_HOME", &target_config)],
+    )?)?;
+    assert_eq!(
+        std::fs::read_to_string(target_alpha.join("AGENTS.md"))?,
+        "Alpha instructions.\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(target_beta.join("AGENTS.md"))?,
+        "Beta instructions.\n"
+    );
+    let verified = success_json(&run(
+        temp.path(),
+        &target_state,
+        &[
+            "verify",
+            "--input",
+            package.to_str().ok_or("package path is not UTF-8")?,
+            "--plan",
+            plan.to_str().ok_or("plan path is not UTF-8")?,
+            "--json",
+        ],
+        &[("CODEX_HOME", &target_config)],
+    )?)?;
+    assert_eq!(verified["data"]["files_verified"], 2);
+    Ok(())
+}
+
+#[test]
 fn recovery_list_is_read_only_when_no_prepared_journals_exist()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
@@ -816,6 +1075,8 @@ fn run(
 ) -> Result<Output, Box<dyn std::error::Error>> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mnemo"));
     command.current_dir(current_dir).args(arguments);
+    command.env("HOME", state_root.join("home"));
+    command.env("USERPROFILE", state_root.join("home"));
     command.env("MNEMOPORT_STATE_ROOT", state_root);
     command.env("XDG_DATA_HOME", state_root.join("data"));
     command.env("XDG_CONFIG_HOME", state_root.join("config"));

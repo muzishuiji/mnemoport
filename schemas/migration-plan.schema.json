@@ -20,6 +20,11 @@
     "target": { "$ref": "product-tuple.schema.json" },
     "adapter_version": { "type": "string", "minLength": 1 },
     "capability_snapshot_hash": { "$ref": "#/$defs/hash" },
+    "workspace_mappings": {
+      "type": "object",
+      "propertyNames": { "pattern": "^sha256:[a-f0-9]{64}$" },
+      "additionalProperties": { "type": "string", "minLength": 1 }
+    },
     "operations": {
       "type": "array",
       "items": {

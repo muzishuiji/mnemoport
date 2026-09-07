@@ -37,17 +37,33 @@ impl PlatformAdapter for CursorAdapter {
     }
 
     fn inventory(&self, mode: CollectionMode) -> Result<Vec<InventoryItem>, AdapterError> {
+        let workspace = current_directory()?;
+        self.inventory_at(mode, &workspace)
+    }
+
+    fn inventory_at(
+        &self,
+        mode: CollectionMode,
+        workspace: &Path,
+    ) -> Result<Vec<InventoryItem>, AdapterError> {
         let config = resolve_root("CURSOR_AGENT_CONFIG_DIR", ".cursor")?.path;
         let home = user_home()?;
-        let workspace = current_directory()?;
-        Ok(collect_from_roots(&config, &home, &workspace, mode)?.inventory)
+        Ok(collect_from_roots(&config, &home, workspace, mode)?.inventory)
     }
 
     fn extract(&self, mode: CollectionMode) -> Result<Vec<ExtractedAsset>, AdapterError> {
+        let workspace = current_directory()?;
+        self.extract_at(mode, &workspace)
+    }
+
+    fn extract_at(
+        &self,
+        mode: CollectionMode,
+        workspace: &Path,
+    ) -> Result<Vec<ExtractedAsset>, AdapterError> {
         let config = resolve_root("CURSOR_AGENT_CONFIG_DIR", ".cursor")?.path;
         let home = user_home()?;
-        let workspace = current_directory()?;
-        Ok(collect_from_roots(&config, &home, &workspace, mode)?.extracted)
+        Ok(collect_from_roots(&config, &home, workspace, mode)?.extracted)
     }
 }
 

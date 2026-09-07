@@ -134,6 +134,7 @@ pub enum PackageError {
 #[derive(Debug, Default)]
 pub struct PackageBuilder {
     objects: BTreeMap<String, Vec<u8>>,
+    required_features: BTreeSet<String>,
 }
 
 impl PackageBuilder {
@@ -155,6 +156,12 @@ impl PackageBuilder {
         Ok(())
     }
 
+    /// Declare a format feature that readers must understand before opening
+    /// the package. Added feature names are serialized deterministically.
+    pub fn require_feature(&mut self, feature: impl Into<String>) {
+        self.required_features.insert(feature.into());
+    }
+
     /// Build a deterministic archive signed by `signing_key`.
     pub fn build(&self, signing_key: &SigningKey) -> Result<SignedPackage, PackageError> {
         let descriptors = self
@@ -167,8 +174,14 @@ impl PackageBuilder {
             })
             .collect::<Vec<_>>();
         let root_hash = descriptor_root_hash(&descriptors);
+        let mut header = ManifestHeader::default();
+        for feature in &self.required_features {
+            if !header.required_features.contains(feature) {
+                header.required_features.push(feature.clone());
+            }
+        }
         let manifest = PackageManifest {
-            header: ManifestHeader::default(),
+            header,
             package_id: format!("mnemo:{root_hash}"),
             root_hash,
             signer_public_key: hex::encode(signing_key.verifying_key().to_bytes()),
@@ -334,7 +347,7 @@ fn validate_manifest_contract(manifest: &PackageManifest) -> Result<(), PackageE
             manifest.header.format_version
         )));
     }
-    let supported = ["signed-manifest", "sha256-objects"];
+    let supported = ["portable-workspaces", "sha256-objects", "signed-manifest"];
     if let Some(feature) = manifest
         .header
         .required_features
