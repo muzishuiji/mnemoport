@@ -16,17 +16,18 @@ The Rust core owns deterministic schemas, path and content policy, package verif
 
 1. `doctor` resolves platform tuples without creating product directories.
 2. `inventory` reports supported and inventory-only assets without asset bodies.
-3. `export` extracts supported assets, removes credential values, signs, compresses, and encrypts one `.mnemo` file to a destination recipient or passphrase.
-4. `inspect` decrypts and verifies the package without target writes.
-5. `plan` resolves any explicit portable workspace ids through a target-local map, renders against the exact target tuple, and snapshots the canonical mappings plus current target hashes.
-6. `apply` rebuilds the plan, rejects drift, then commits local files with journals and backups; its ledger transaction and managed-object ownership update are atomic.
-7. `verify` independently rebuilds L0 target bytes and checks current target hashes. With `--level l1`, it may then run an exact-tuple native discovery recipe against a disposable clone.
-8. `report` reads operation and journal evidence from the local ledger.
-9. `undo` restores only unchanged post-apply targets.
+3. `plugin-inventory` optionally invokes an exact, admitted vendor list interface and emits path-free normalized reinstall intent; it does not feed Apply in P1-C, while vendor-created incidental local state remains possible.
+4. `export` extracts supported assets, removes credential values, signs, compresses, and encrypts one `.mnemo` file to a destination recipient or passphrase.
+5. `inspect` decrypts and verifies the package without target writes.
+6. `plan` resolves any explicit portable workspace ids through a target-local map, renders against the exact target tuple, and snapshots the canonical mappings plus current target hashes.
+7. `apply` rebuilds the plan, rejects drift, then commits local files with journals and backups; its ledger transaction and managed-object ownership update are atomic.
+8. `verify` independently rebuilds L0 target bytes and checks current target hashes. With `--level l1`, it may then run an exact-tuple native discovery recipe against a disposable clone.
+9. `report` reads operation and journal evidence from the local ledger.
+10. `undo` restores only unchanged post-apply targets.
 
 If a process stops between a synced `prepared` journal and its final `committed` journal—or after that commit but before the ledger acknowledgement—`doctor` and `recovery list` classify the target from exact before/current/after hashes and ledger presence. `recovery rollback` restores a verified backup or closes a transaction whose target never changed. A third state is reported as manual review and never changed automatically. Undo reverses the managed-object ownership change together with the transaction: a prior owner is restored for an update, while ownership first created by the undone migration is removed.
 
-Product discovery is also split by effect. `detect` only resolves files and executables. The explicit `probe` path runs a bounded adapter-owned `--version` command in a disposable home and records entrypoint-specific version evidence. Asset-level L1 uses a separate fixed-command recipe, structured parser, timeout, hard output limit, and disposable copy of only the required target state. Neither path initializes migrated components, and version success cannot be promoted to asset-level discovery evidence.
+Product discovery is also split by effect. `detect` only resolves files and executables. The explicit `probe` path runs a bounded adapter-owned `--version` command in a disposable home and records entrypoint-specific version evidence. `plugin-inventory` uses the live source configuration only after exact tuple admission, passes fixed read-only arguments with credential-bearing environment removed, and retains normalized intent plus a raw-output hash rather than product paths or bytes. Asset-level L1 uses a separate fixed-command recipe, structured parser, timeout, hard output limit, and disposable copy of only the required target state. None of these paths initializes migrated components, and version or inventory success cannot be promoted to target asset-level discovery evidence.
 
 For same-tool moves between devices, `handoff` packages a user-selected new-session capsule using the same signing and encryption path. The destination receives a Markdown sidecar; MnemoPort never injects a private session database.
 

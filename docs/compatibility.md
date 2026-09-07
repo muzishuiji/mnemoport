@@ -27,4 +27,16 @@ The repository test suite exercises all 16 source→target directions for Instru
 
 The exact fixture evidence is published as [machine-readable compatibility data](compatibility.json). Native product discovery (L1) and component execution (L2) remain separate, versioned claims; fixture success never upgrades an untested product version or GUI/remote entrypoint.
 
-The same file records the latest Linux observations. Version probing recognized Claude Code CLI `2.1.259`, Codex CLI `0.144.1`, Qoder CLI `1.1.42`, Cursor Agent `2026.09.02-c22c1a3`, and the Cursor IDE command launcher `3.17.21`; Qoder Desktop remained a separate unsupported entrypoint. Actual end-to-end native discovery verified only Codex CLI `0.144.1` MCP and Qoder CLI `1.1.42` Skill recipes. Instructions and all other product/asset cells remain explicit manual outcomes; different versions, operating systems, entrypoints, or roots do not inherit those claims. See [Product probes](product-probes.md).
+## Plugin and extension inventory
+
+`mnemo plugin-inventory` is a separate explicit local-assisted read. On Linux,
+the currently admitted exact tuples are Claude Code CLI `2.1.259`, Codex CLI
+`0.144.1`, and Cursor IDE launcher `3.17.21`. Claude and Codex use their JSON
+plugin list; Cursor IDE contributes only its ID/version extension list. Cursor
+Agent plugins, Cursor Plugins from Customize, and Qoder CLI/Desktop/IDE plugins
+remain explicit manual cells because the observed entrypoints do not expose an
+admitted structured installed-state export. No cache, binary, install path, or
+raw command output is retained, and nothing is installed. See
+[Authoritative plugin and extension inventory](plugin-inventory.md).
+
+The same file records the latest Linux observations. Version probing recognized Claude Code CLI `2.1.259`, Codex CLI `0.144.1`, Qoder CLI `1.1.42`, Cursor Agent `2026.09.02-c22c1a3`, and the Cursor IDE command launcher `3.17.21`; Qoder Desktop remained a separate unsupported entrypoint. Actual end-to-end native discovery verified only Codex CLI `0.144.1` MCP and Qoder CLI `1.1.42` Skill recipes. A later 2026-09-08 read-only inventory collected zero Claude plugins, ten Codex plugins, and four Cursor IDE extensions on the local test host; Cursor Agent remained manual and the then-current Qoder CLI executable was unavailable. Counts describe that one test host, not a portable product default. Instructions and all other product/asset cells remain explicit manual outcomes; different versions, operating systems, entrypoints, or roots do not inherit those claims. See [Product probes](product-probes.md).

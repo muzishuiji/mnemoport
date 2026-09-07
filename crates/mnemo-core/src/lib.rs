@@ -4,8 +4,8 @@ use mnemo_adapter_claude_code::ClaudeCodeAdapter;
 use mnemo_adapter_codex::CodexAdapter;
 use mnemo_adapter_common::{AdapterError, PlatformAdapter};
 use mnemo_adapter_common::{
-    CanonicalAssetInput, CollectionMode, ExtractedAsset, InventoryItem, RenderedFile, TargetRoot,
-    make_asset, user_home,
+    CanonicalAssetInput, CollectionMode, ExtractedAsset, InventoryItem, PluginInventoryOptions,
+    RenderedFile, TargetRoot, make_asset, user_home,
 };
 use mnemo_adapter_cursor::CursorAdapter;
 use mnemo_adapter_qoder::QoderAdapter;
@@ -13,8 +13,8 @@ use mnemo_package::{PackageBuilder, PackageError, SignedPackage, VerifiedPackage
 use mnemo_schema::{
     ApplyPhase, ApprovalClass, AssetKind, AssetPayload, AssetProbe, AssetProbeMethod,
     AssetProbeStatus, Entrypoint, MigrationPlan, PlanOperation, PlanOperationKind,
-    PlanPrecondition, Platform, ProbeStatus, ProductProbe, ProductTuple, RollbackGuarantee,
-    ScopeLevel, Sensitivity, WorkspaceDescriptor, WorkspaceMap,
+    PlanPrecondition, Platform, PluginInventoryReport, ProbeStatus, ProductProbe, ProductTuple,
+    RollbackGuarantee, ScopeLevel, Sensitivity, WorkspaceDescriptor, WorkspaceMap,
 };
 use mnemo_security::{FindingSeverity, scan_and_redact, sha256_id, validate_portable_path};
 use mnemo_store::{
@@ -1205,6 +1205,22 @@ pub fn inventory(
     Ok(adapter.inventory(mode)?)
 }
 
+/// Run explicit read-only plugin/extension inventory for one source platform.
+/// Each entrypoint reports collected, manual, unavailable, unsupported-version,
+/// or failed independently.
+pub fn plugin_inventory(
+    platform: Platform,
+    options: &PluginInventoryOptions,
+) -> Result<Vec<PluginInventoryReport>, CoreError> {
+    let adapter = adapters()
+        .into_iter()
+        .find(|candidate| candidate.platform() == platform)
+        .ok_or_else(|| {
+            CoreError::InvalidBundle(format!("adapter missing for {}", platform.as_str()))
+        })?;
+    Ok(adapter.plugin_inventory(options)?)
+}
+
 /// Inventory one platform at an explicit local workspace without changing the
 /// process working directory.
 pub fn inventory_at(
@@ -1771,7 +1787,7 @@ fn validate_kind_payload(kind: AssetKind, payload: &AssetPayload) -> Result<(), 
             AssetPayload::Text(_)
         ) | (AssetKind::Skill, AssetPayload::FileTree(_))
             | (AssetKind::Mcp, AssetPayload::McpServer(_))
-            | (AssetKind::Plugin, AssetPayload::PluginIntent { .. })
+            | (AssetKind::Plugin, AssetPayload::PluginIntent(_))
             | (AssetKind::Handoff, AssetPayload::Handoff(_))
             | (AssetKind::InventoryOnly, AssetPayload::Inventory(_))
     );

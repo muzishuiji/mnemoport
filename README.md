@@ -11,13 +11,17 @@ Tool X              ->  canonical asset model    ->  Tool Y
 
 MnemoPort is an alpha available as prerelease binaries or from source. Its Rust CLI, signed and encrypted package format, transactional apply/undo, four offline adapters, four thin host Skills, and all 16 Core source→target smoke directions are implemented and tested. Native auto-memory stores, account/cloud data, plugin network installation, and broad preference migration remain deliberately non-automatic.
 
+The latest binary tag is `v0.1.0-alpha.1`. Portable multi-workspace mapping and
+the authoritative `plugin-inventory` command documented below are currently on
+`main` and will enter the next prerelease; install from source to use them now.
+
 MnemoPort is model-provider independent. It does not call an LLM API and never needs an OpenAI, Anthropic, DeepSeek, or other model-provider API key. It runs locally under the AI coding tool the user already authenticated. Package encryption uses either a destination-owned age identity or the user-chosen `MNEMOPORT_PASSPHRASE`; neither is a model credential.
 
 ## Supported hosts and assets
 
 The alpha supports `claude-code`, `codex`, `qoder`, and `cursor` as both source and target hosts. All 4 × 4 Core directions, including X→X, are exercised in the repository test matrix.
 
-| Asset | Current alpha behavior |
+| Asset | Current `main` behavior |
 |---|---|
 | Instructions/rules | File-backed user/project sources; exact X→X paths where stable, safe target-native mapping across tools |
 | Skills | Complete file trees rooted by `SKILL.md`; symlinks rejected, active/non-text content quarantined and never auto-applied |
@@ -284,6 +288,33 @@ The probe invokes only the adapter-owned `--version` argument, without a shell o
 
 This is version-level L1 evidence, not proof that a particular migrated asset was discovered. Asset-level L1 is requested separately with `mnemo verify --level l1`; every automatic recipe uses fixed arguments, a disposable private copy of only the required target state, a timeout, bounded output, and a structured parser. It never starts migrated MCP servers, Skills, plugins, or hooks. The child process is not placed in an OS network namespace, so run probes only for an installed executable you trust. See [Product probes](docs/product-probes.md) for the exact boundary and compatibility matrix.
 
+### Authoritative plugin and extension inventory
+
+P1-C adds an explicit read-only inventory command. It normalizes reinstall intent
+from vendor-owned interfaces without copying caches or extension binaries and
+without loading any plugin component:
+
+```bash
+mnemo plugin-inventory --from claude-code --json
+mnemo plugin-inventory --from codex --json
+mnemo plugin-inventory --from qoder --json
+mnemo plugin-inventory --from cursor --json
+```
+
+The admitted Linux tuples are Claude Code CLI `2.1.259` via
+`plugin list --json`, Codex CLI `0.144.1` via `plugin list --json`, and Cursor
+IDE `3.17.21` via `--list-extensions --show-versions`. Cursor Agent has no
+installed-plugin list in the observed entrypoint; Qoder's official CLI list and
+Desktop/IDE UI do not yet expose an admitted structured export. Those reports
+remain explicit `manual`/`unavailable`, and a mixed result exits `2` even when
+another entrypoint was collected successfully.
+
+Cursor supports explicit `--profile NAME` and `--extensions-dir PATH`; all
+products support `--workspace PATH`. Local paths and raw vendor output are
+removed from the result. No plugin is packaged or installed in this phase. See
+[Authoritative plugin and extension inventory](docs/plugin-inventory.md) for
+the exact tuple matrix, normalized fields, safety boundary, and status meanings.
+
 ### New-session Handoff capsule
 
 Handoff carries a user-reviewed task summary into a fresh session without copying a product session database. Create JSON conforming to [`handoff.schema.json`](schemas/handoff.schema.json), then package it on the source device:
@@ -302,6 +333,7 @@ For recipient encryption, replace the environment variable with `--recipient 'ag
 | `mnemo doctor [--json]` | No | Resolve MnemoPort state and detected product tuples |
 | `mnemo detect [--platform HOST] [--json]` | No | Detect one or all supported hosts without launching them |
 | `mnemo probe [--platform HOST] [--json]` | Disposable probe state only | Run bounded, version-level L1 probes for safe entrypoints |
+| `mnemo plugin-inventory --from HOST [--workspace PATH] [--json]` | No MnemoPort target write; vendor may create incidental local state | Normalize installed plugin/extension intent for exact version tuples |
 | `mnemo inventory --from HOST [--workspace LABEL=PATH]` | No | List supported assets and manual-only candidates without bodies |
 | `mnemo export --from HOST --output FILE [--workspace LABEL=PATH]` | No | Extract, redact/quarantine, sign, compress, and encrypt a new package |
 | `mnemo inspect FILE` | No | Decrypt, verify, and summarize a package |
@@ -352,7 +384,7 @@ Overrides select roots; they do not expand the asset allowlist. Run `mnemo docto
 
 ## Safety guarantees and limits
 
-- Source inventory and extraction are read-only and never launch the source product.
+- Normal source inventory and extraction are offline-static and never launch the source product; only explicit `plugin-inventory` and probe/L1 commands invoke admitted read-only vendor interfaces.
 - `.mnemo` content is deterministic, zstd-compressed, Ed25519-signed, and age-encrypted by default.
 - Paths, symlinks, archive sizes, signatures, hashes, object closure, and target preconditions are verified.
 - Explicit source workspace paths stay local; exact target mappings are validated and bound into the plan identity.
@@ -362,7 +394,7 @@ Overrides select roots; they do not expand the asset allowlist. Run `mnemo docto
 - Scripts, hooks, plugins, and MCP servers are not executed during inventory, inspect, plan, or the default L0 verification.
 - `--allow-plaintext` is an explicit escape hatch for intentional non-sensitive fixtures. It should not be used for real personal assets.
 
-The alpha does not perform network plugin/extension installation, CLI dependency installation, OAuth/account export, MCP server execution, native auto-memory import, or broad editor-profile synchronization. It records or inventories these surfaces only when the adapter can do so safely. Prepared and committed-but-unacknowledged crash recovery, atomic managed ownership, version-level probes, and the two exact-tuple asset-level L1 recipes documented above are implemented. Native claims outside that narrow matrix remain manual. Release artifact and provenance claims apply only after the tagged workflow succeeds.
+The alpha does not perform network plugin/extension installation, CLI dependency installation, OAuth/account export, MCP server execution, native auto-memory import, or broad editor-profile synchronization. It records or inventories these surfaces only when the adapter can do so safely. Prepared and committed-but-unacknowledged crash recovery, atomic managed ownership, version-level probes, authoritative plugin inventory for the exact tuples above, and the two exact-tuple asset-level L1 recipes are implemented. Native claims outside those narrow matrices remain manual. Release artifact and provenance claims apply only after the tagged workflow succeeds.
 
 ## Troubleshooting
 

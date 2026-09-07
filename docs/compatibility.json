@@ -1,7 +1,8 @@
 {
   "schema_version": "1.0",
   "release": "0.1.0-alpha.1",
-  "generated_on": "2026-09-06",
+  "implementation_state": "main-after-v0.1.0-alpha.1",
+  "generated_on": "2026-09-08",
   "evidence_policy": "Claims do not transfer across version, OS, entrypoint, asset, or direction.",
   "fixture_contract": {
     "source_version": "fixture-contract-v0.1",
@@ -65,6 +66,71 @@
       "cursor": ["instruction", "skill", "mcp"]
     }
   },
+  "native_plugin_inventory_observation": {
+    "observed_on": "2026-09-08",
+    "os": "linux",
+    "level": "authoritative-inventory-only",
+    "boundary": "Installed intent is normalized from admitted vendor list interfaces; no plugin component is loaded, packaged, installed, or removed.",
+    "results": [
+      {
+        "platform": "claude-code",
+        "entrypoint": "cli",
+        "version": "2.1.259",
+        "status": "collected",
+        "method": "vendor_json_list",
+        "arguments": ["plugin", "list", "--json"],
+        "installed_count": 0,
+        "migrated_components_started": false
+      },
+      {
+        "platform": "codex",
+        "entrypoint": "cli",
+        "version": "0.144.1",
+        "status": "collected",
+        "method": "vendor_json_list",
+        "arguments": ["plugin", "list", "--json"],
+        "installed_count": 10,
+        "migrated_components_started": false
+      },
+      {
+        "platform": "qoder",
+        "entrypoint": "cli",
+        "version": null,
+        "status": "unavailable",
+        "method": "none",
+        "installed_count": null,
+        "migrated_components_started": false
+      },
+      {
+        "platform": "qoder",
+        "entrypoint": "desktop-app",
+        "version": null,
+        "status": "manual",
+        "method": "official_ui_no_structured_export",
+        "installed_count": null,
+        "migrated_components_started": false
+      },
+      {
+        "platform": "cursor",
+        "entrypoint": "agent",
+        "version": "2026.09.02-c22c1a3",
+        "status": "manual",
+        "method": "no_installed_plugin_list",
+        "installed_count": null,
+        "migrated_components_started": false
+      },
+      {
+        "platform": "cursor",
+        "entrypoint": "ide-editor",
+        "version": "3.17.21",
+        "status": "collected",
+        "method": "vendor_versioned_line_list",
+        "arguments": ["--list-extensions", "--show-versions", "--user-data-dir", "<resolved-user-data-dir>"],
+        "installed_count": 4,
+        "migrated_components_started": false
+      }
+    ]
+  },
   "directions": [
     { "source": "claude-code", "target": "claude-code", "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
     { "source": "claude-code", "target": "codex",       "asset_status": { "instruction": "verified", "skill": "verified", "mcp": "verified", "handoff": "verified" } },
@@ -85,7 +151,7 @@
   ],
   "non_automatic_assets": {
     "native_auto_memory": "manual_or_inventory_only",
-    "plugins_and_extensions": "manual_intent_only",
+    "plugins_and_extensions": "authoritative_inventory_only_no_install",
     "cli_dependencies": "manual_intent_only",
     "editor_profile": "use_official_export_import",
     "sessions_and_auth": "excluded"

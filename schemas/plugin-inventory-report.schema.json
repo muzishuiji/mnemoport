@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mnemoport.io/schemas/plugin-inventory-report.schema.json",
+  "title": "MnemoPort Plugin Inventory Report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "tuple",
+    "status",
+    "diagnostic",
+    "intents",
+    "vendor_command_executed",
+    "migrated_components_started"
+  ],
+  "properties": {
+    "tuple": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "version", "os", "entrypoint", "executable", "config_root", "evidence"],
+      "properties": {
+        "platform": { "enum": ["claude-code", "codex", "qoder", "cursor"] },
+        "version": { "type": ["string", "null"] },
+        "os": { "type": "string", "minLength": 1 },
+        "entrypoint": {
+          "enum": ["cli", "desktop-app", "ide-editor", "jetbrains", "agent", "unknown"]
+        },
+        "executable": { "type": ["string", "null"] },
+        "config_root": { "type": ["string", "null"] },
+        "evidence": {
+          "enum": ["documented", "observed", "probe", "official_interface", "excluded"]
+        }
+      }
+    },
+    "status": {
+      "enum": ["collected", "unavailable", "manual", "unsupported_version", "failed"]
+    },
+    "diagnostic": { "type": "string", "minLength": 1 },
+    "intents": {
+      "type": "array",
+      "items": { "$ref": "canonical-asset.schema.json#/$defs/pluginIntent" }
+    },
+    "vendor_command_executed": { "type": "boolean" },
+    "migrated_components_started": { "const": false }
+  }
+}

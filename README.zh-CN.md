@@ -11,13 +11,17 @@ MnemoPort 是面向个人 AI 资产的开源可移植层。它可以在 Codex、
 
 MnemoPort 当前是可以下载预发布二进制、也可以从源码安装的 Alpha 版本。Rust CLI、签名加密包格式、事务式 Apply/Undo、四个离线 Adapter、四个轻量宿主 Skill，以及全部 16 条核心 Source→Target 冒烟路径均已实现并通过测试。原生自动记忆、账号/云端数据、插件联网安装和大范围偏好设置迁移仍有意保持为非自动操作。
 
+最新二进制标签仍是 `v0.1.0-alpha.1`。下文的 portable multi-workspace
+映射和权威 `plugin-inventory` 命令目前位于 `main`，将在下一预发布版本中
+提供；如需立即使用，请从源码安装。
+
 MnemoPort 与模型供应商无关。它不会调用 LLM API，也不需要 OpenAI、Anthropic、DeepSeek 或其他模型供应商的 API Key。它在用户已经登录的 AI 编程工具中本地运行。资产包可以使用目标设备持有的 age 身份或用户自选的 `MNEMOPORT_PASSPHRASE` 加密；两者都不是模型凭据。
 
 ## 支持的宿主与资产
 
 当前 Alpha 支持将 `claude-code`、`codex`、`qoder` 和 `cursor` 同时作为来源宿主和目标宿主。仓库测试矩阵覆盖全部 4 × 4 核心迁移方向，包括 X→X。
 
-| 资产 | 当前 Alpha 行为 |
+| 资产 | 当前 `main` 行为 |
 |---|---|
 | 指令/规则 | 支持基于文件的用户级和项目级来源；稳定且安全时，X→X 保留原生路径，跨工具迁移映射到目标工具的原生格式 |
 | Skills | 迁移以 `SKILL.md` 为根的完整文件树；拒绝符号链接，活动内容或非文本内容会被隔离，绝不自动应用 |
@@ -284,6 +288,29 @@ mnemo probe --platform cursor --json
 
 这只是版本级 L1 证据，并不能证明某项迁入资产已被目标产品发现。资产级 L1 需要通过 `mnemo verify --level l1` 单独请求；每个自动配方都使用固定参数、仅包含所需目标状态的一次性私有副本、超时、输出硬上限和结构化解析器，并且不会启动迁入的 MCP Server、Skill、插件或 Hook。子进程没有被放入操作系统网络命名空间，因此只应对你信任的已安装可执行文件运行。精确边界和兼容矩阵参见[产品探测](docs/product-probes.md)。
 
+### 权威插件与扩展盘点
+
+P1-C 新增一个显式只读盘点命令。它只从厂商提供的接口归一化“可重装意图”，不复制缓存或扩展二进制，也不加载任何插件组件：
+
+```bash
+mnemo plugin-inventory --from claude-code --json
+mnemo plugin-inventory --from codex --json
+mnemo plugin-inventory --from qoder --json
+mnemo plugin-inventory --from cursor --json
+```
+
+当前准入的 Linux 精确 tuple 是：Claude Code CLI `2.1.259` 的
+`plugin list --json`、Codex CLI `0.144.1` 的 `plugin list --json`，以及
+Cursor IDE `3.17.21` 的 `--list-extensions --show-versions`。实测 Cursor
+Agent 入口没有“已安装插件”列表；Qoder 官方 CLI list 和 Desktop/IDE UI
+尚无 MnemoPort 准入的结构化导出。因此这些入口会明确返回
+`manual`/`unavailable`；即使同一产品的另一个入口盘点成功，混合结果仍返回退出码 `2`。
+
+Cursor 可显式使用 `--profile NAME` 与 `--extensions-dir PATH`；所有产品都
+可以使用 `--workspace PATH`。本机路径和厂商原始输出不会出现在结果里。
+这一阶段不会把插件打入 `.mnemo`，也不会安装插件。精确矩阵、归一化字段、
+安全边界与状态语义参见[权威插件与扩展盘点](docs/plugin-inventory.md)。
+
 ### 新会话 Handoff Capsule
 
 Handoff 会把用户审阅过的任务摘要带入一个全新会话，而不是复制产品的会话数据库。先创建符合 [`handoff.schema.json`](schemas/handoff.schema.json) 的 JSON，然后在来源设备上打包：
@@ -302,6 +329,7 @@ mnemo handoff --input handoff.json --output handoff.mnemo --json
 | `mnemo doctor [--json]` | 否 | 解析 MnemoPort 状态路径和已检测到的产品 tuple |
 | `mnemo detect [--platform HOST] [--json]` | 否 | 在不启动产品的情况下检测一个或全部受支持宿主 |
 | `mnemo probe [--platform HOST] [--json]` | 仅一次性探测状态 | 对安全入口执行有界的版本级 L1 探测 |
+| `mnemo plugin-inventory --from HOST [--workspace PATH] [--json]` | MnemoPort 不写目标；厂商进程可能产生附带本地状态 | 为精确版本 tuple 归一化已安装插件/扩展意图 |
 | `mnemo inventory --from HOST [--workspace LABEL=PATH]` | 否 | 在不包含正文的情况下列出受支持资产和仅能手动处理的候选项 |
 | `mnemo export --from HOST --output FILE [--workspace LABEL=PATH]` | 否 | 提取、脱敏/隔离、签名、压缩并加密新包 |
 | `mnemo inspect FILE` | 否 | 解密、验证并汇总包内容 |
@@ -352,7 +380,7 @@ MnemoPort 只读取 Adapter 批准的路径以及当前 workspace。隔离测试
 
 ## 安全保证与限制
 
-- 来源盘点和提取只读，绝不启动来源产品。
+- 常规来源盘点与提取是离线静态操作，绝不启动来源产品；只有显式 `plugin-inventory` 和 probe/L1 命令会调用准入的只读厂商接口。
 - `.mnemo` 内容具有确定性，使用 zstd 压缩、Ed25519 签名，并默认通过 age 加密。
 - 路径、符号链接、归档大小、签名、哈希、对象闭包和目标前置条件都会被验证。
 - 显式来源工作区路径只保留在本机；目标精确映射经过验证并绑定到计划身份。
@@ -362,7 +390,7 @@ MnemoPort 只读取 Adapter 批准的路径以及当前 workspace。隔离测试
 - 在 inventory、inspect、plan 和默认 L0 验证过程中，不执行脚本、Hooks、插件或 MCP Server。
 - `--allow-plaintext` 仅用于用户明确确认不敏感的 fixture。真实个人资产不应使用该选项。
 
-当前 Alpha 不会执行插件/扩展联网安装、CLI 依赖安装、OAuth/账号导出、MCP Server 执行、原生自动记忆导入或大范围编辑器 Profile 同步。只有在 Adapter 能够安全处理时，才会记录或盘点这些表面。prepared 与已提交但未确认事务的崩溃恢复、原子受管所有权、版本级探测，以及上文两个精确 tuple 的资产级 L1 配方都已实现；矩阵之外的原生能力仍明确降级为手动处理。发布制品和 provenance 声明只有在带 tag 的工作流成功后才成立。
+当前 Alpha 不会执行插件/扩展联网安装、CLI 依赖安装、OAuth/账号导出、MCP Server 执行、原生自动记忆导入或大范围编辑器 Profile 同步。只有在 Adapter 能够安全处理时，才会记录或盘点这些表面。prepared 与已提交但未确认事务的崩溃恢复、原子受管所有权、版本级探测、上文精确 tuple 的权威插件盘点，以及两个资产级 L1 配方都已实现；这些窄矩阵之外的原生能力仍明确降级为手动处理。发布制品和 provenance 声明只有在带 tag 的工作流成功后才成立。
 
 ## 故障排查
 

@@ -2,6 +2,11 @@
 
 `mnemo detect` never starts a product. `mnemo probe` is a separate, explicit local-assisted operation that produces version-level evidence for an exact platform, OS, and entrypoint tuple. After L0 file verification succeeds, `mnemo verify --level l1` can request asset-level native discovery for the same exact tuple.
 
+Installed plugin/extension discovery is exposed separately as
+`mnemo plugin-inventory`. It reads source-side intent and does not prove that a
+target loaded a migrated component. Its exact commands, tuple matrix, and
+privacy boundary are documented in [Plugin inventory](plugin-inventory.md).
+
 ## Safety contract
 
 - The adapter supplies the executable and the single literal argument `--version`; package contents, filenames, migrated configuration, and user prompts cannot contribute arguments.
@@ -36,7 +41,7 @@ Qoder detection deliberately reports the CLI and Desktop as separate tuples. A D
 | `failed` | Spawn, exit status, or version parsing failed |
 | `timed_out` | The process exceeded five seconds and was terminated |
 
-Any result other than `verified` makes the command return exit code `2`. Even `verified` upgrades only the version-level tuple evidence to `probe`; it does not upgrade Instructions, Skills, MCP, plugins, GUI, remote, or cloud capabilities.
+Any result other than `verified` makes the command return exit code `2`. Even `verified` upgrades only the version-level tuple evidence to `probe`; it does not upgrade Instructions, Skills, MCP, plugins, GUI, remote, or cloud capabilities. Likewise, a `collected` plugin inventory is source evidence only and is not target L1 or component execution evidence.
 
 ## Asset-level discovery gate
 

@@ -2,8 +2,9 @@
 
 use mnemo_schema::{
     AssetKind, AssetPayload, AssetProvenance, CanonicalAsset, Entrypoint, EvidenceLevel,
-    McpServerAsset, Platform, ProbeMethod, ProbeStatus, ProductProbe, ProductTuple, ScopeLevel,
-    Sensitivity,
+    McpServerAsset, Platform, PluginCompensation, PluginEcosystem, PluginInstallScope,
+    PluginIntentAsset, PluginInventoryEvidence, PluginInventoryReport, PluginInventoryStatus,
+    PluginSubtype, ProbeMethod, ProbeStatus, ProductProbe, ProductTuple, ScopeLevel, Sensitivity,
 };
 use mnemo_security::{SecurityError, scan_and_redact, sha256_id, validate_portable_path};
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,17 @@ pub struct ExtractedAsset {
     pub asset: CanonicalAsset,
     /// Exact or redacted object bodies keyed by SHA-256 id.
     pub objects: BTreeMap<String, Vec<u8>>,
+}
+
+/// Explicit local context for authoritative plugin/extension inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginInventoryOptions {
+    /// Workspace used by product scopes. The command never changes the parent process cwd.
+    pub workspace: PathBuf,
+    /// Cursor named profile, when explicitly selected.
+    pub profile: Option<String>,
+    /// Cursor extension root, when explicitly selected.
+    pub extensions_dir: Option<PathBuf>,
 }
 
 /// One deterministic local file proposed by a target adapter.
@@ -490,6 +502,18 @@ pub trait PlatformAdapter: Send + Sync {
     fn probe(&self) -> Result<Vec<ProductProbe>, AdapterError> {
         Ok(self.detect()?.into_iter().map(probe_version).collect())
     }
+    /// Run only exact, adapter-owned, read-only plugin/extension inventory
+    /// recipes. Unsupported entrypoints return explicit reports rather than
+    /// guessing from caches.
+    fn plugin_inventory(
+        &self,
+        options: &PluginInventoryOptions,
+    ) -> Result<Vec<PluginInventoryReport>, AdapterError> {
+        self.detect()?
+            .into_iter()
+            .map(|tuple| plugin_inventory_for_tuple(tuple, options))
+            .collect()
+    }
     /// Return metadata only. M0 adapters may return an empty inventory.
     fn inventory(&self, mode: CollectionMode) -> Result<Vec<InventoryItem>, AdapterError>;
     /// Return metadata for one explicitly selected workspace without changing
@@ -516,6 +540,7 @@ pub trait PlatformAdapter: Send + Sync {
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OUTPUT_LIMIT: u64 = 8 * 1024;
 const PROBE_OUTPUT_LIMIT_USIZE: usize = 8 * 1024;
+const PLUGIN_INVENTORY_OUTPUT_LIMIT: u64 = 1024 * 1024;
 
 /// Run the single fixed `--version` probe permitted for supported entrypoints.
 /// The child receives a disposable home and a small environment allowlist.
@@ -671,6 +696,14 @@ fn finish_probe(
             "version_command_timed_out",
             true,
         ),
+        (ProbeExecution::OutputLimitExceeded, _) => probe_result(
+            tuple,
+            ProbeStatus::Failed,
+            ProbeMethod::VersionCommand,
+            vec!["--version".to_owned()],
+            "version_output_limit_exceeded",
+            true,
+        ),
         (ProbeExecution::SpawnFailed, _) => probe_result(
             tuple,
             ProbeStatus::Failed,
@@ -715,6 +748,7 @@ enum ProbeExecution {
     Completed { success: bool },
     TimedOut,
     SpawnFailed,
+    OutputLimitExceeded,
 }
 
 fn run_bounded(mut command: Command, timeout: Duration) -> ProbeExecution {
@@ -742,6 +776,53 @@ fn run_bounded(mut command: Command, timeout: Duration) -> ProbeExecution {
             }
         }
     }
+}
+
+fn run_bounded_with_output_limit(
+    mut command: Command,
+    timeout: Duration,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    limit: u64,
+) -> ProbeExecution {
+    let Ok(mut child) = command.spawn() else {
+        return ProbeExecution::SpawnFailed;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        if output_size(stdout_path, stderr_path).is_ok_and(|size| size > limit) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return ProbeExecution::OutputLimitExceeded;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if output_size(stdout_path, stderr_path).is_ok_and(|size| size > limit) {
+                    return ProbeExecution::OutputLimitExceeded;
+                }
+                return ProbeExecution::Completed {
+                    success: status.success(),
+                };
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ProbeExecution::TimedOut;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ProbeExecution::SpawnFailed;
+            }
+        }
+    }
+}
+
+fn output_size(stdout_path: &Path, stderr_path: &Path) -> std::io::Result<u64> {
+    Ok(fs::metadata(stdout_path)?
+        .len()
+        .saturating_add(fs::metadata(stderr_path)?.len()))
 }
 
 fn read_probe_output(stdout_path: &Path, stderr_path: &Path) -> std::io::Result<Vec<u8>> {
@@ -788,6 +869,594 @@ fn probe_scratch_path() -> PathBuf {
 fn copy_environment_if_present(command: &mut Command, name: &str) {
     if let Some(value) = std::env::var_os(name) {
         command.env(name, value);
+    }
+}
+
+fn plugin_inventory_for_tuple(
+    tuple: ProductTuple,
+    options: &PluginInventoryOptions,
+) -> Result<PluginInventoryReport, AdapterError> {
+    validate_plugin_inventory_options(options)?;
+    let Some(executable) = tuple.executable.clone() else {
+        return Ok(plugin_inventory_report(
+            tuple,
+            PluginInventoryStatus::Unavailable,
+            "plugin_inventory_executable_unavailable",
+            Vec::new(),
+            false,
+        ));
+    };
+
+    if !has_authoritative_plugin_recipe(tuple.platform, &tuple.entrypoint) {
+        let diagnostic = manual_plugin_diagnostic(tuple.platform, &tuple.entrypoint);
+        return Ok(plugin_inventory_report(
+            tuple,
+            PluginInventoryStatus::Manual,
+            diagnostic,
+            Vec::new(),
+            false,
+        ));
+    }
+
+    let version_probe = probe_version(tuple);
+    if version_probe.status != ProbeStatus::Verified {
+        return Ok(plugin_inventory_report(
+            version_probe.tuple,
+            PluginInventoryStatus::Failed,
+            "plugin_inventory_version_probe_failed",
+            Vec::new(),
+            false,
+        ));
+    }
+    let tuple = version_probe.tuple;
+    if !is_admitted_plugin_tuple(&tuple) {
+        return Ok(plugin_inventory_report(
+            tuple,
+            PluginInventoryStatus::UnsupportedVersion,
+            "plugin_inventory_tuple_not_admitted",
+            Vec::new(),
+            false,
+        ));
+    }
+
+    run_plugin_inventory_command(tuple, &executable, options)
+}
+
+fn validate_plugin_inventory_options(options: &PluginInventoryOptions) -> Result<(), AdapterError> {
+    let metadata = fs::metadata(&options.workspace).map_err(|source| AdapterError::Io {
+        path: options.workspace.clone(),
+        source,
+    })?;
+    if !metadata.is_dir() {
+        return Err(AdapterError::InvalidData {
+            path: options.workspace.clone(),
+            message: "plugin inventory workspace must be a directory".to_owned(),
+        });
+    }
+    if let Some(profile) = &options.profile {
+        validate_inventory_text(profile, "Cursor profile", 128).map_err(|message| {
+            AdapterError::InvalidData {
+                path: options.workspace.clone(),
+                message,
+            }
+        })?;
+    }
+    if let Some(path) = &options.extensions_dir {
+        let metadata = fs::metadata(path).map_err(|source| AdapterError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.is_dir() {
+            return Err(AdapterError::InvalidData {
+                path: path.clone(),
+                message: "Cursor extensions directory must be a directory".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn has_authoritative_plugin_recipe(platform: Platform, entrypoint: &Entrypoint) -> bool {
+    matches!(
+        (platform, entrypoint),
+        (Platform::ClaudeCode | Platform::Codex, Entrypoint::Cli)
+            | (Platform::Cursor, Entrypoint::IdeEditor)
+    )
+}
+
+fn manual_plugin_diagnostic(platform: Platform, entrypoint: &Entrypoint) -> &'static str {
+    match (platform, entrypoint) {
+        (Platform::Qoder, Entrypoint::Cli) => "qoder_cli_list_has_no_admitted_structured_contract",
+        (Platform::Qoder, _) => "qoder_gui_inventory_requires_official_ui_export",
+        (Platform::Cursor, Entrypoint::Agent) => "cursor_agent_has_no_installed_plugin_list",
+        (Platform::Codex, Entrypoint::IdeEditor) => "codex_ide_plugins_not_supported",
+        _ => "plugin_inventory_entrypoint_not_admitted",
+    }
+}
+
+fn is_admitted_plugin_tuple(tuple: &ProductTuple) -> bool {
+    if tuple.os != "linux" {
+        return false;
+    }
+    matches!(
+        (tuple.platform, &tuple.entrypoint, tuple.version.as_deref()),
+        (Platform::ClaudeCode, Entrypoint::Cli, Some("2.1.259"))
+            | (Platform::Codex, Entrypoint::Cli, Some("0.144.1"))
+            | (Platform::Cursor, Entrypoint::IdeEditor, Some("3.17.21"))
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_plugin_inventory_command(
+    tuple: ProductTuple,
+    executable: &Path,
+    options: &PluginInventoryOptions,
+) -> Result<PluginInventoryReport, AdapterError> {
+    let scratch = probe_scratch_path();
+    fs::create_dir(&scratch).map_err(|source| AdapterError::Io {
+        path: scratch.clone(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&scratch, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            AdapterError::Io {
+                path: scratch.clone(),
+                source,
+            }
+        })?;
+    }
+    let stdout_path = scratch.join("stdout");
+    let stderr_path = scratch.join("stderr");
+    let stdout = File::create(&stdout_path).map_err(|source| AdapterError::Io {
+        path: stdout_path.clone(),
+        source,
+    })?;
+    let stderr = File::create(&stderr_path).map_err(|source| AdapterError::Io {
+        path: stderr_path.clone(),
+        source,
+    })?;
+    let mut command = Command::new(executable);
+    command
+        .env_clear()
+        .current_dir(&options.workspace)
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    for name in [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TMP",
+        "TEMP",
+        "TMPDIR",
+    ] {
+        copy_environment_if_present(&mut command, name);
+    }
+    if let Some(root) = &tuple.config_root {
+        match tuple.platform {
+            Platform::ClaudeCode => {
+                command.env("CLAUDE_CONFIG_DIR", root);
+            }
+            Platform::Codex => {
+                command.env("CODEX_HOME", root);
+            }
+            Platform::Qoder => {
+                command.env("QODER_CONFIG_DIR", root);
+            }
+            Platform::Cursor => {}
+        }
+    }
+
+    let evidence_arguments = match (tuple.platform, &tuple.entrypoint) {
+        (Platform::ClaudeCode | Platform::Codex, Entrypoint::Cli) => {
+            command.args(["plugin", "list", "--json"]);
+            vec!["plugin", "list", "--json"]
+        }
+        (Platform::Cursor, Entrypoint::IdeEditor) => {
+            command.args(["--list-extensions", "--show-versions"]);
+            let mut arguments = vec!["--list-extensions", "--show-versions"];
+            if let Some(root) = &tuple.config_root {
+                command.arg("--user-data-dir").arg(root);
+                arguments.extend(["--user-data-dir", "<resolved-user-data-dir>"]);
+            }
+            if let Some(profile) = &options.profile {
+                command.arg("--profile").arg(profile);
+                arguments.extend(["--profile", "<selected-profile>"]);
+            }
+            if let Some(path) = &options.extensions_dir {
+                command.arg("--extensions-dir").arg(path);
+                arguments.extend(["--extensions-dir", "<selected-extensions-dir>"]);
+            }
+            arguments
+        }
+        _ => unreachable!("recipe admission and command construction must agree"),
+    }
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+
+    let execution = run_bounded_with_output_limit(
+        command,
+        PROBE_TIMEOUT,
+        &stdout_path,
+        &stderr_path,
+        PLUGIN_INVENTORY_OUTPUT_LIMIT,
+    );
+    let output = read_inventory_output(&stdout_path);
+    let _ = fs::remove_dir_all(&scratch);
+    match (execution, output) {
+        (ProbeExecution::Completed { success: true }, Ok(output)) => {
+            let version = tuple.version.clone().unwrap_or_default();
+            let evidence = PluginInventoryEvidence {
+                product_version: version,
+                arguments: evidence_arguments,
+                output_hash: sha256_id(&output),
+                structured: tuple.platform != Platform::Cursor,
+            };
+            let intents = match tuple.platform {
+                Platform::ClaudeCode => parse_claude_plugin_inventory(&output, &evidence),
+                Platform::Codex => parse_codex_plugin_inventory(&output, &evidence),
+                Platform::Cursor => {
+                    parse_cursor_extension_inventory(&output, options.profile.as_deref(), &evidence)
+                }
+                Platform::Qoder => unreachable!("Qoder has no admitted structured recipe"),
+            };
+            match intents {
+                Ok(intents) => Ok(plugin_inventory_report(
+                    tuple,
+                    PluginInventoryStatus::Collected,
+                    "plugin_inventory_collected",
+                    intents,
+                    true,
+                )),
+                Err(_) => Ok(plugin_inventory_report(
+                    tuple,
+                    PluginInventoryStatus::Failed,
+                    "plugin_inventory_output_rejected",
+                    Vec::new(),
+                    true,
+                )),
+            }
+        }
+        (ProbeExecution::TimedOut, _) => Ok(plugin_inventory_report(
+            tuple,
+            PluginInventoryStatus::Failed,
+            "plugin_inventory_command_timed_out",
+            Vec::new(),
+            true,
+        )),
+        (ProbeExecution::SpawnFailed, _) => Ok(plugin_inventory_report(
+            tuple,
+            PluginInventoryStatus::Failed,
+            "plugin_inventory_command_spawn_failed",
+            Vec::new(),
+            true,
+        )),
+        (ProbeExecution::OutputLimitExceeded, _) => Ok(plugin_inventory_report(
+            tuple,
+            PluginInventoryStatus::Failed,
+            "plugin_inventory_output_limit_exceeded",
+            Vec::new(),
+            true,
+        )),
+        (ProbeExecution::Completed { success: false }, _) => Ok(plugin_inventory_report(
+            tuple,
+            PluginInventoryStatus::Failed,
+            "plugin_inventory_command_failed",
+            Vec::new(),
+            true,
+        )),
+        (_, Err(_)) => Ok(plugin_inventory_report(
+            tuple,
+            PluginInventoryStatus::Failed,
+            "plugin_inventory_output_too_large_or_unreadable",
+            Vec::new(),
+            true,
+        )),
+    }
+}
+
+fn read_inventory_output(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    File::open(path)?
+        .take(PLUGIN_INVENTORY_OUTPUT_LIMIT + 1)
+        .read_to_end(&mut output)?;
+    if u64::try_from(output.len()).unwrap_or(u64::MAX) > PLUGIN_INVENTORY_OUTPUT_LIMIT {
+        return Err(std::io::Error::other(
+            "plugin inventory output limit exceeded",
+        ));
+    }
+    Ok(output)
+}
+
+fn parse_claude_plugin_inventory(
+    output: &[u8],
+    evidence: &PluginInventoryEvidence,
+) -> Result<Vec<PluginIntentAsset>, String> {
+    let entries = serde_json::from_slice::<serde_json::Value>(output)
+        .map_err(|_| "Claude plugin inventory is not JSON".to_owned())?;
+    let entries = entries
+        .as_array()
+        .ok_or_else(|| "Claude plugin inventory must be an array".to_owned())?;
+    let mut intents = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| "Claude plugin entry must be an object".to_owned())?;
+        let identifier = required_inventory_string(entry, "id", 512)?;
+        validate_plugin_identifier(&identifier, "Claude plugin id")?;
+        let resolved_version = required_inventory_string(entry, "version", 128)?;
+        validate_plugin_version(&resolved_version, "Claude plugin version")?;
+        let scope = match required_inventory_string(entry, "scope", 32)?.as_str() {
+            "user" => PluginInstallScope::User,
+            "project" => PluginInstallScope::Project,
+            "local" => PluginInstallScope::Local,
+            "managed" => PluginInstallScope::Managed,
+            _ => return Err("Claude plugin scope is not recognized".to_owned()),
+        };
+        let enabled = entry
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| "Claude plugin enabled must be boolean".to_owned())?;
+        let marketplace = identifier
+            .rsplit_once('@')
+            .map(|(_, marketplace)| marketplace)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Claude plugin id must be marketplace-qualified".to_owned())?
+            .to_owned();
+        validate_marketplace_label(&marketplace, "Claude marketplace")?;
+        intents.push(plugin_intent(
+            identifier,
+            Some(format!("marketplace:{marketplace}")),
+            PluginEcosystem::ClaudeCodePlugin,
+            PluginSubtype::NativePlugin,
+            Some(resolved_version),
+            scope,
+            Entrypoint::Cli,
+            Some(enabled),
+            None,
+            None,
+            evidence,
+        ));
+    }
+    sort_plugin_intents(&mut intents)?;
+    Ok(intents)
+}
+
+fn parse_codex_plugin_inventory(
+    output: &[u8],
+    evidence: &PluginInventoryEvidence,
+) -> Result<Vec<PluginIntentAsset>, String> {
+    let document = serde_json::from_slice::<serde_json::Value>(output)
+        .map_err(|_| "Codex plugin inventory is not JSON".to_owned())?;
+    let entries = document
+        .get("installed")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "Codex plugin inventory is missing installed array".to_owned())?;
+    let mut intents = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| "Codex plugin entry must be an object".to_owned())?;
+        let installed = entry
+            .get("installed")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| "Codex plugin installed must be boolean".to_owned())?;
+        if !installed {
+            continue;
+        }
+        let identifier = required_inventory_string(entry, "pluginId", 512)?;
+        validate_plugin_identifier(&identifier, "Codex plugin id")?;
+        let resolved_version = required_inventory_string(entry, "version", 128)?;
+        validate_plugin_version(&resolved_version, "Codex plugin version")?;
+        let marketplace = required_inventory_string(entry, "marketplaceName", 256)?;
+        validate_marketplace_label(&marketplace, "Codex marketplace")?;
+        let enabled = entry
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| "Codex plugin enabled must be boolean".to_owned())?;
+        let install_policy = required_inventory_string(entry, "installPolicy", 128)?;
+        let auth_policy = required_inventory_string(entry, "authPolicy", 128)?;
+        validate_policy_token(&install_policy, "Codex install policy")?;
+        validate_policy_token(&auth_policy, "Codex auth policy")?;
+        intents.push(plugin_intent(
+            identifier,
+            Some(format!("marketplace:{marketplace}")),
+            PluginEcosystem::CodexPlugin,
+            PluginSubtype::NativePlugin,
+            Some(resolved_version),
+            PluginInstallScope::Device,
+            Entrypoint::Cli,
+            Some(enabled),
+            Some(install_policy),
+            Some(auth_policy),
+            evidence,
+        ));
+    }
+    sort_plugin_intents(&mut intents)?;
+    Ok(intents)
+}
+
+fn parse_cursor_extension_inventory(
+    output: &[u8],
+    profile: Option<&str>,
+    evidence: &PluginInventoryEvidence,
+) -> Result<Vec<PluginIntentAsset>, String> {
+    let text = std::str::from_utf8(output)
+        .map_err(|_| "Cursor extension inventory is not UTF-8".to_owned())?;
+    let mut intents = Vec::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let (identifier, resolved_version) = line
+            .rsplit_once('@')
+            .ok_or_else(|| "Cursor extension tuple is missing version".to_owned())?;
+        validate_inventory_text(identifier, "Cursor extension identifier", 512)?;
+        validate_plugin_identifier(identifier, "Cursor extension identifier")?;
+        validate_inventory_text(resolved_version, "Cursor extension version", 128)?;
+        validate_plugin_version(resolved_version, "Cursor extension version")?;
+        intents.push(plugin_intent(
+            identifier.to_owned(),
+            Some("cursor-extension-marketplace".to_owned()),
+            PluginEcosystem::CursorIdeExtension,
+            PluginSubtype::IdeExtension,
+            Some(resolved_version.to_owned()),
+            if profile.is_some() {
+                PluginInstallScope::Profile
+            } else {
+                PluginInstallScope::User
+            },
+            Entrypoint::IdeEditor,
+            None,
+            None,
+            None,
+            evidence,
+        ));
+    }
+    sort_plugin_intents(&mut intents)?;
+    Ok(intents)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plugin_intent(
+    identifier: String,
+    source: Option<String>,
+    ecosystem: PluginEcosystem,
+    subtype: PluginSubtype,
+    resolved_version: Option<String>,
+    scope: PluginInstallScope,
+    entrypoint: Entrypoint,
+    enabled: Option<bool>,
+    install_policy: Option<String>,
+    auth_policy: Option<String>,
+    evidence: &PluginInventoryEvidence,
+) -> PluginIntentAsset {
+    PluginIntentAsset {
+        identifier,
+        version: None,
+        source,
+        ecosystem: Some(ecosystem),
+        subtype: Some(subtype),
+        requested_version: None,
+        resolved_version,
+        scope: Some(scope),
+        entrypoint: Some(entrypoint),
+        enabled,
+        install_policy,
+        auth_policy,
+        inventory_evidence: Some(evidence.clone()),
+        compensation: Some(PluginCompensation::OfficialRemoveIfPermitted),
+    }
+}
+
+fn required_inventory_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    maximum: usize,
+) -> Result<String, String> {
+    let value = object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("plugin inventory field {key} must be a string"))?;
+    validate_inventory_text(value, key, maximum)?;
+    Ok(value.to_owned())
+}
+
+fn validate_inventory_text(value: &str, label: &str, maximum: usize) -> Result<(), String> {
+    if value.is_empty() || value.len() > maximum || value.chars().any(char::is_control) {
+        return Err(format!("{label} is empty, oversized, or contains controls"));
+    }
+    Ok(())
+}
+
+fn validate_plugin_identifier(value: &str, label: &str) -> Result<(), String> {
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '@')
+    }) {
+        Ok(())
+    } else {
+        Err(format!("{label} contains non-portable characters"))
+    }
+}
+
+fn validate_plugin_version(value: &str, label: &str) -> Result<(), String> {
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '+')
+    }) {
+        Ok(())
+    } else {
+        Err(format!("{label} contains non-portable characters"))
+    }
+}
+
+fn validate_marketplace_label(value: &str, label: &str) -> Result<(), String> {
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | ' ')
+    }) {
+        Ok(())
+    } else {
+        Err(format!("{label} contains path or non-portable characters"))
+    }
+}
+
+fn validate_policy_token(value: &str, label: &str) -> Result<(), String> {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        Ok(())
+    } else {
+        Err(format!("{label} contains non-portable characters"))
+    }
+}
+
+fn sort_plugin_intents(intents: &mut [PluginIntentAsset]) -> Result<(), String> {
+    intents.sort_by(|left, right| {
+        (left.ecosystem, &left.source, &left.identifier).cmp(&(
+            right.ecosystem,
+            &right.source,
+            &right.identifier,
+        ))
+    });
+    for pair in intents.windows(2) {
+        if pair[0].ecosystem == pair[1].ecosystem
+            && pair[0].source == pair[1].source
+            && pair[0].identifier == pair[1].identifier
+        {
+            return Err("plugin inventory contains duplicate identifiers".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn plugin_inventory_report(
+    mut tuple: ProductTuple,
+    status: PluginInventoryStatus,
+    diagnostic: &str,
+    intents: Vec<PluginIntentAsset>,
+    vendor_command_executed: bool,
+) -> PluginInventoryReport {
+    // Inventory reports are designed to be portable evidence. Resolved local
+    // executable and configuration paths are useful to `detect`, but must not
+    // leak into an intent report that a user may save or share.
+    tuple.executable = None;
+    tuple.config_root = None;
+    PluginInventoryReport {
+        tuple,
+        status,
+        diagnostic: diagnostic.to_owned(),
+        intents,
+        vendor_command_executed,
+        migrated_components_started: false,
     }
 }
 
@@ -1645,7 +2314,8 @@ mod tests {
     use super::{
         CanonicalAssetInput, ExtractedAsset, collect_json_mcp_if_present,
         collect_toml_mcp_if_present, extract_version, make_asset, merge_mcp_json, merge_mcp_toml,
-        probe_version,
+        parse_claude_plugin_inventory, parse_codex_plugin_inventory,
+        parse_cursor_extension_inventory, probe_version, run_bounded_with_output_limit,
     };
 
     #[test]
@@ -1681,9 +2351,144 @@ mod tests {
         Ok(())
     }
     use mnemo_schema::{
-        AssetPayload, Entrypoint, EvidenceLevel, Platform, ProbeStatus, ProductTuple, ScopeLevel,
-        Sensitivity,
+        AssetPayload, Entrypoint, EvidenceLevel, Platform, PluginEcosystem, PluginInstallScope,
+        PluginInventoryEvidence, ProbeStatus, ProductTuple, ScopeLevel, Sensitivity,
     };
+
+    fn plugin_evidence(structured: bool) -> PluginInventoryEvidence {
+        PluginInventoryEvidence {
+            product_version: "fixture-version".to_owned(),
+            arguments: vec!["plugin".to_owned(), "list".to_owned()],
+            output_hash: mnemo_security::sha256_id(b"fixture-output"),
+            structured,
+        }
+    }
+
+    #[test]
+    fn parses_claude_inventory_without_retaining_install_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path_canary = "/private/source/device/plugin/cache";
+        let output = serde_json::to_vec(&serde_json::json!([{
+            "id": "reviewer@team-marketplace",
+            "version": "1.2.3",
+            "scope": "project",
+            "enabled": true,
+            "installPath": path_canary
+        }]))?;
+        let intents = parse_claude_plugin_inventory(&output, &plugin_evidence(true))?;
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].identifier, "reviewer@team-marketplace");
+        assert_eq!(intents[0].scope, Some(PluginInstallScope::Project));
+        assert_eq!(
+            intents[0].ecosystem,
+            Some(PluginEcosystem::ClaudeCodePlugin)
+        );
+        assert_eq!(intents[0].resolved_version.as_deref(), Some("1.2.3"));
+        assert!(!serde_json::to_string(&intents)?.contains(path_canary));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_duplicate_or_unqualified_claude_plugin_ids() {
+        let duplicate = br#"[
+            {"id":"reviewer@market","version":"1.0.0","scope":"user","enabled":true},
+            {"id":"reviewer@market","version":"1.0.0","scope":"user","enabled":true}
+        ]"#;
+        assert!(parse_claude_plugin_inventory(duplicate, &plugin_evidence(true)).is_err());
+        let unqualified = br#"[{"id":"reviewer","version":"1.0.0","scope":"user","enabled":true}]"#;
+        assert!(parse_claude_plugin_inventory(unqualified, &plugin_evidence(true)).is_err());
+    }
+
+    #[test]
+    fn parses_codex_installed_only_and_discards_local_source_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path_canary = "/private/source/device/codex-plugin";
+        let output = serde_json::to_vec(&serde_json::json!({
+            "installed": [
+                {
+                    "pluginId": "installed-plugin",
+                    "name": "Installed Plugin",
+                    "marketplaceName": "curated",
+                    "version": "4.5.6",
+                    "installed": true,
+                    "enabled": false,
+                    "source": {"source": "local", "path": path_canary},
+                    "marketplaceSource": {"sourceType": "local", "source": path_canary},
+                    "installPolicy": "AVAILABLE",
+                    "authPolicy": "ON_USE"
+                },
+                {
+                    "pluginId": "available-only",
+                    "name": "Available Only",
+                    "marketplaceName": "curated",
+                    "version": "1.0.0",
+                    "installed": false,
+                    "enabled": false,
+                    "source": {"source": "local", "path": path_canary},
+                    "marketplaceSource": {"sourceType": "local", "source": path_canary},
+                    "installPolicy": "AVAILABLE",
+                    "authPolicy": "ON_INSTALL"
+                }
+            ],
+            "available": []
+        }))?;
+        let intents = parse_codex_plugin_inventory(&output, &plugin_evidence(true))?;
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].identifier, "installed-plugin");
+        assert_eq!(intents[0].scope, Some(PluginInstallScope::Device));
+        assert_eq!(intents[0].auth_policy.as_deref(), Some("ON_USE"));
+        assert!(!serde_json::to_string(&intents)?.contains(path_canary));
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_extensions_preserve_profile_scope_and_reject_noise()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let intents = parse_cursor_extension_inventory(
+            b"publisher.alpha@1.2.3\npublisher.beta@2026.9.0-pre\n",
+            Some("portable"),
+            &plugin_evidence(false),
+        )?;
+        assert_eq!(intents.len(), 2);
+        assert!(
+            intents
+                .iter()
+                .all(|intent| intent.scope == Some(PluginInstallScope::Profile))
+        );
+        assert!(
+            parse_cursor_extension_inventory(
+                b"warning: unavailable\npublisher.alpha@1.2.3\n",
+                None,
+                &plugin_evidence(false),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_inventory_stops_on_combined_output_limit() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let stdout_path = temp.path().join("stdout");
+        let stderr_path = temp.path().join("stderr");
+        let stdout = std::fs::File::create(&stdout_path)?;
+        let stderr = std::fs::File::create(&stderr_path)?;
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "printf '%070000d' 0"])
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr));
+        let result = run_bounded_with_output_limit(
+            command,
+            std::time::Duration::from_secs(2),
+            &stdout_path,
+            &stderr_path,
+            1024,
+        );
+        assert!(matches!(result, super::ProbeExecution::OutputLimitExceeded));
+        Ok(())
+    }
 
     #[test]
     fn json_mcp_extraction_keeps_refs_not_values() -> Result<(), Box<dyn std::error::Error>> {

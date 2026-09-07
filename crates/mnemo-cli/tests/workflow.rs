@@ -1067,6 +1067,59 @@ fn handoff_package_installs_only_a_new_session_sidecar() -> Result<(), Box<dyn s
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn authoritative_plugin_inventory_is_bounded_normalized_and_secret_free()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let state = temp.path().join("state");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&workspace)?;
+    std::fs::create_dir_all(&bin)?;
+    let executable = bin.join("claude");
+    std::fs::write(
+        &executable,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  test -z "$MNEMOPORT_FAKE_SECRET" || exit 90
+  printf '%s\n' '2.1.259 (Claude Code)'
+  exit 0
+fi
+test "$1" = "plugin" || exit 91
+test "$2" = "list" || exit 92
+test "$3" = "--json" || exit 93
+test -z "$MNEMOPORT_FAKE_SECRET" || exit 94
+printf '%s\n' '[{"id":"reviewer@fixture-market","version":"1.2.3","scope":"user","enabled":true,"installPath":"/private/source/plugin-cache"}]'
+"#,
+    )?;
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+    let secret_canary = temp.path().join("must-not-reach-vendor-command");
+    let output = run(
+        &workspace,
+        &state,
+        &["plugin-inventory", "--from", "claude-code", "--json"],
+        &[("PATH", &bin), ("MNEMOPORT_FAKE_SECRET", &secret_canary)],
+    )?;
+    let report = success_json(&output)?;
+    assert_eq!(report["phase"], "plugin-inventory");
+    assert_eq!(report["data"][0]["status"], "collected");
+    assert_eq!(report["data"][0]["vendor_command_executed"], true);
+    assert_eq!(report["data"][0]["migrated_components_started"], false);
+    assert_eq!(
+        report["data"][0]["intents"][0]["identifier"],
+        "reviewer@fixture-market"
+    );
+    assert_eq!(report["data"][0]["intents"][0]["resolved_version"], "1.2.3");
+    let serialized = serde_json::to_string(&report)?;
+    assert!(!serialized.contains("/private/source/plugin-cache"));
+    assert!(!serialized.contains("must-not-reach-vendor-command"));
+    assert!(!serialized.contains(temp.path().to_string_lossy().as_ref()));
+    Ok(())
+}
+
 fn run(
     current_dir: &Path,
     state_root: &Path,

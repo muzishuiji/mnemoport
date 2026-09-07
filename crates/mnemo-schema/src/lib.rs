@@ -407,6 +407,165 @@ pub struct McpServerAsset {
     pub header_refs: Vec<String>,
 }
 
+/// Plugin or extension ecosystem. These values are intentionally not merged:
+/// equal-looking identifiers in different ecosystems are different assets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PluginEcosystem {
+    /// Claude Code marketplace plugin.
+    ClaudeCodePlugin,
+    /// Codex/ChatGPT shared-catalog plugin as seen from Codex CLI.
+    CodexPlugin,
+    /// Qoder CLI plugin.
+    QoderPlugin,
+    /// Portable Agent Plugin loaded by Cursor.
+    CursorAgentPlugin,
+    /// Cursor-specific plugin.
+    CursorPlugin,
+    /// VS Code-compatible extension installed in Cursor IDE.
+    CursorIdeExtension,
+}
+
+/// Product-specific plugin category retained by the canonical intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginSubtype {
+    /// A product-native plugin package.
+    NativePlugin,
+    /// Agent Plugins open-standard package.
+    AgentPlugin,
+    /// IDE/editor extension.
+    IdeExtension,
+}
+
+/// Installation scope reported by the authoritative product interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginInstallScope {
+    /// Organization-managed installation.
+    Organization,
+    /// User-wide installation.
+    User,
+    /// Shared project installation.
+    Project,
+    /// Project-local installation.
+    Local,
+    /// Vendor-managed read-only installation.
+    Managed,
+    /// Named editor profile.
+    Profile,
+    /// Device-local state when the vendor does not expose a narrower scope.
+    Device,
+    /// The authoritative interface did not disclose scope.
+    Unknown,
+}
+
+/// Safe inverse expected for a future installation action. P1 inventory does
+/// not execute it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginCompensation {
+    /// Use the product's official removal interface if policy permits.
+    OfficialRemoveIfPermitted,
+    /// No reliable automated inverse is currently admitted.
+    Manual,
+}
+
+/// Machine-readable evidence attached to a normalized inventory entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInventoryEvidence {
+    /// Exact product version that emitted the inventory.
+    pub product_version: String,
+    /// Fixed adapter-owned arguments, excluding the executable path.
+    pub arguments: Vec<String>,
+    /// Hash of the complete bounded vendor output; raw output is not retained.
+    pub output_hash: String,
+    /// Whether the vendor output was structured JSON rather than a line protocol.
+    pub structured: bool,
+}
+
+/// Reinstall intent derived from an authoritative product inventory. Legacy
+/// `version` and `source` remain optional for v1 payload compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginIntentAsset {
+    /// Stable publisher/name, marketplace-qualified id, or extension id.
+    pub identifier: String,
+    /// Legacy v1 version field; new inventory writes `resolved_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Trusted marketplace/source label with local absolute paths removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Ecosystem that owns this identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ecosystem: Option<PluginEcosystem>,
+    /// Product-specific plugin category.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtype: Option<PluginSubtype>,
+    /// Version requested by source policy, when the vendor discloses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_version: Option<String>,
+    /// Version currently resolved on the source host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_version: Option<String>,
+    /// Installation scope disclosed by the vendor interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<PluginInstallScope>,
+    /// Product entrypoint that produced this intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Entrypoint>,
+    /// Whether the source reports the plugin as enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Vendor installation policy, when exposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_policy: Option<String>,
+    /// Vendor authentication policy, when exposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_policy: Option<String>,
+    /// Evidence for the normalized entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_evidence: Option<PluginInventoryEvidence>,
+    /// Future inverse action; informational in P1-C.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compensation: Option<PluginCompensation>,
+}
+
+/// Result of one authoritative plugin/extension inventory attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginInventoryStatus {
+    /// The admitted vendor interface returned a complete normalized inventory.
+    Collected,
+    /// Required executable is not installed.
+    Unavailable,
+    /// This product entrypoint has no admitted read-only inventory interface.
+    Manual,
+    /// A safe recipe exists, but not for this exact observed version/OS tuple.
+    UnsupportedVersion,
+    /// The bounded command or strict parser failed closed.
+    Failed,
+}
+
+/// Entry-point-specific plugin inventory report. A collected empty list means
+/// the vendor authoritatively reported no installed entries; all other empty
+/// lists carry a non-collected status and diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInventoryReport {
+    /// Exact product tuple checked by this report.
+    pub tuple: ProductTuple,
+    /// Inventory outcome.
+    pub status: PluginInventoryStatus,
+    /// Stable log-safe result code.
+    pub diagnostic: String,
+    /// Normalized reinstall intents. Raw caches and command output are absent.
+    pub intents: Vec<PluginIntentAsset>,
+    /// Whether a product process was invoked using fixed read-only arguments.
+    pub vendor_command_executed: bool,
+    /// Always false for inventory.
+    pub migrated_components_started: bool,
+}
+
 /// Typed canonical asset body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
@@ -418,14 +577,7 @@ pub enum AssetPayload {
     /// Credential-free MCP definition.
     McpServer(McpServerAsset),
     /// Reinstall intent, not opaque installed plugin state.
-    PluginIntent {
-        /// Stable publisher/name or marketplace id.
-        identifier: String,
-        /// Requested version when known.
-        version: Option<String>,
-        /// Trusted source registry or URL when known.
-        source: Option<String>,
-    },
+    PluginIntent(PluginIntentAsset),
     /// Structured inventory that is preserved but not automatically applied.
     Inventory(Value),
     /// Current-work continuation capsule.
@@ -666,7 +818,7 @@ impl CommandResponse<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandResponse, Platform};
+    use super::{AssetPayload, CommandResponse, Platform};
 
     #[test]
     fn platform_aliases_are_stable() {
@@ -683,6 +835,30 @@ mod tests {
     }
 
     #[test]
+    fn legacy_plugin_intent_payload_remains_readable() -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = serde_json::json!({
+            "type": "plugin_intent",
+            "value": {
+                "identifier": "publisher.plugin",
+                "version": "1.2.3",
+                "source": "marketplace"
+            }
+        });
+        let payload: AssetPayload = serde_json::from_value(encoded.clone())?;
+        let AssetPayload::PluginIntent(intent) = payload else {
+            panic!("expected plugin intent");
+        };
+        assert_eq!(intent.identifier, "publisher.plugin");
+        assert_eq!(intent.version.as_deref(), Some("1.2.3"));
+        assert_eq!(intent.ecosystem, None);
+        assert_eq!(
+            serde_json::to_value(AssetPayload::PluginIntent(intent))?,
+            encoded
+        );
+        Ok(())
+    }
+
+    #[test]
     fn checked_in_schemas_are_valid_json() {
         let command_schema = include_str!("../../../schemas/command-response.schema.json");
         let tuple_schema = include_str!("../../../schemas/product-tuple.schema.json");
@@ -692,6 +868,8 @@ mod tests {
         let workspace_descriptor_schema =
             include_str!("../../../schemas/workspace-descriptor.schema.json");
         let workspace_map_schema = include_str!("../../../schemas/workspace-map.schema.json");
+        let plugin_inventory_schema =
+            include_str!("../../../schemas/plugin-inventory-report.schema.json");
         for schema in [
             command_schema,
             tuple_schema,
@@ -700,6 +878,7 @@ mod tests {
             handoff_schema,
             workspace_descriptor_schema,
             workspace_map_schema,
+            plugin_inventory_schema,
         ] {
             assert!(serde_json::from_str::<serde_json::Value>(schema).is_ok());
         }

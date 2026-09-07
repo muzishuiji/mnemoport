@@ -3,10 +3,10 @@
 use age::secrecy::{ExposeSecret, SecretString};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
-use mnemo_adapter_common::CollectionMode;
+use mnemo_adapter_common::{CollectionMode, PluginInventoryOptions};
 use mnemo_schema::{
     AssetProbe, AssetProbeStatus, CommandResponse, Diagnostic, MigrationPlan, PlanOperationKind,
-    Platform, ProbeStatus, WorkspaceDescriptor, WorkspaceMap,
+    Platform, PluginInventoryStatus, ProbeStatus, WorkspaceDescriptor, WorkspaceMap,
 };
 use mnemo_store::{Ledger, OperationStatus};
 use serde::Serialize;
@@ -49,6 +49,24 @@ enum Command {
         /// Optional platform identifier.
         #[arg(long, value_parser = parse_platform)]
         platform: Option<Platform>,
+        /// Emit the stable JSON response envelope.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read installed plugin/extension intent through admitted vendor interfaces.
+    PluginInventory {
+        /// Source platform.
+        #[arg(long = "from", value_parser = parse_platform)]
+        from: Platform,
+        /// Explicit workspace used to resolve project/local plugin scopes.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        /// Explicit Cursor IDE profile. Other products reject this option.
+        #[arg(long, value_name = "NAME")]
+        profile: Option<String>,
+        /// Explicit Cursor IDE extension root. Other products reject this option.
+        #[arg(long, value_name = "PATH")]
+        extensions_dir: Option<PathBuf>,
         /// Emit the stable JSON response envelope.
         #[arg(long)]
         json: bool,
@@ -504,6 +522,54 @@ fn run(cli: Cli) -> Result<u8> {
             }
             emit(json, "probe", report)?;
         }
+        Command::PluginInventory {
+            from,
+            workspace,
+            profile,
+            extensions_dir,
+            json,
+        } => {
+            if from != Platform::Cursor && (profile.is_some() || extensions_dir.is_some()) {
+                anyhow::bail!("--profile and --extensions-dir are only valid for Cursor");
+            }
+            let workspace = workspace
+                .map(|path| {
+                    fs::canonicalize(&path).with_context(|| {
+                        format!(
+                            "plugin inventory workspace is unavailable: {}",
+                            path.display()
+                        )
+                    })
+                })
+                .transpose()?
+                .unwrap_or(std::env::current_dir()?);
+            let extensions_dir = extensions_dir
+                .map(|path| {
+                    fs::canonicalize(&path).with_context(|| {
+                        format!(
+                            "Cursor extensions directory is unavailable: {}",
+                            path.display()
+                        )
+                    })
+                })
+                .transpose()?;
+            let report = mnemo_core::plugin_inventory(
+                from,
+                &PluginInventoryOptions {
+                    workspace,
+                    profile,
+                    extensions_dir,
+                },
+            )
+            .context("plugin inventory failed")?;
+            if report
+                .iter()
+                .any(|item| item.status != PluginInventoryStatus::Collected)
+            {
+                outcome = 2;
+            }
+            emit(json, "plugin-inventory", report)?;
+        }
         Command::Inventory {
             from,
             invoked_by: _,
@@ -850,6 +916,7 @@ fn command_phase(command: &Command) -> &'static str {
         Command::Doctor { .. } => "doctor",
         Command::Detect { .. } => "detect",
         Command::Probe { .. } => "probe",
+        Command::PluginInventory { .. } => "plugin-inventory",
         Command::Inventory { .. } => "inventory",
         Command::Export { .. } => "export",
         Command::Inspect { .. } => "inspect",
