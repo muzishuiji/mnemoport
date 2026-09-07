@@ -2309,14 +2309,14 @@ pub fn detected_tuple(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::probe_version_with_timeout;
     use super::{
         CanonicalAssetInput, ExtractedAsset, collect_json_mcp_if_present,
         collect_toml_mcp_if_present, extract_version, make_asset, merge_mcp_json, merge_mcp_toml,
         parse_claude_plugin_inventory, parse_codex_plugin_inventory,
-        parse_cursor_extension_inventory, probe_version, run_bounded_with_output_limit,
+        parse_cursor_extension_inventory, probe_version,
     };
+    #[cfg(unix)]
+    use super::{probe_version_with_timeout, run_bounded_with_output_limit};
 
     #[test]
     fn absent_workspace_id_preserves_the_original_v1_asset_identity()
